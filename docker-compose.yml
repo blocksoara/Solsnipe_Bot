@@ -1,0 +1,30 @@
+version: '3.8'
+
+services:
+  solana-sniper-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: solana-sniper-bot
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - TELEGRAM_API_ID=${TELEGRAM_API_ID:-33801866}
+      - TELEGRAM_API_HASH=${TELEGRAM_API_HASH:-6139880385749ef5b9aee207dc41f887}
+      - TELEGRAM_PHONE=${TELEGRAM_PHONE:-+242068658897}
+      - TELEGRAM_CHANNEL=${TELEGRAM_CHANNEL:-pumpdotfunalert}
+      - GMGN_API_KEY=${GMGN_API_KEY:-gmgn_a64e1d6f370b44c4431e582fd1106454}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - SOLANA_RPC_URL=${SOLANA_RPC_URL:-https://api.mainnet-beta.solana.com}
+      - SOLANA_PRIVATE_KEY=${SOLANA_PRIVATE_KEY:-}
+      - TELEGRAM_SESSION_STRING=${TELEGRAM_SESSION_STRING:-}
+      - TELEGRAM_CHANNELS=${TELEGRAM_CHANNELS:-pumpdotfunalert}
+    volumes:
+      - bot-data:/app/server/data
+
+volumes:
+  bot-data:
+

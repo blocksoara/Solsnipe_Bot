@@ -1,0 +1,6 @@
+{
+  "name": "SolSnipe",
+  "description": "Real-time Solana sniper trading bot with dynamic multi-channel Telegram listening, GMGN on-chain analysis, Jupiter & Jito execution, and Dexscreener tracking.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,66 @@
+{
+  "activePositions": [],
+  "tradeHistory": [
+    {
+      "id": "trade_1789914264427_njw3",
+      "tokenAddress": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+      "tokenSymbol": "Bonk",
+      "buyPriceUsd": 0.000002925,
+      "sellPriceUsd": 0.000002925,
+      "amountSol": 0.1,
+      "realizedPnlUsd": 0,
+      "realizedPnlPercent": 0,
+      "openedAt": 1789914258503,
+      "closedAt": 1789914264427,
+      "exitReason": "Test Manual Exit",
+      "router": "jupiter",
+      "executionMode": "simulation"
+    },
+    {
+      "id": "trade_1789911503317_tr8j",
+      "tokenAddress": "AyfpCThXCGm6im5C8CnborAJSpboxHj6BYqxWzS6pump",
+      "tokenSymbol": "JEANPILL",
+      "buyPriceUsd": 0.00002666,
+      "sellPriceUsd": 0.00002817,
+      "amountSol": 0.25,
+      "realizedPnlUsd": 1.53,
+      "realizedPnlPercent": 5.66,
+      "openedAt": 1789911349759,
+      "closedAt": 1789911503317,
+      "exitReason": "Trailing Stop Triggered (-10% from peak)",
+      "router": "jupiter",
+      "executionMode": "simulation"
+    },
+    {
+      "id": "trade_1789911016807_p4p3",
+      "tokenAddress": "2NPtTYKH147AhD1YQvc4gD5p9ZD4SQLHpyC8jhfRpump",
+      "tokenSymbol": "CAT",
+      "buyPriceUsd": 0.000003045,
+      "sellPriceUsd": 0.000002295,
+      "amountSol": 0.25,
+      "realizedPnlUsd": -7.01,
+      "realizedPnlPercent": -24.63,
+      "openedAt": 1789762051124,
+      "closedAt": 1789911016807,
+      "exitReason": "Stop Loss Triggered (-24.6%)",
+      "router": "jupiter",
+      "executionMode": "simulation"
+    },
+    {
+      "id": "trade_1789911016806_bayx",
+      "tokenAddress": "6vAhuB7WrMdiGg5b443LvABQsdQ744wkXQCk6u1Spump",
+      "tokenSymbol": "BURNED",
+      "buyPriceUsd": 0.000003114,
+      "sellPriceUsd": 0.000002527,
+      "amountSol": 0.1,
+      "realizedPnlUsd": -2.15,
+      "realizedPnlPercent": -18.85,
+      "openedAt": 1789762039963,
+      "closedAt": 1789911016806,
+      "exitReason": "Stop Loss Triggered (-18.9%)",
+      "router": "jupiter",
+      "executionMode": "simulation"
+    }
+  ],
+  "savedAt": 1789914264427
+}

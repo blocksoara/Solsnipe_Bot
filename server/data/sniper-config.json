@@ -1,0 +1,19 @@
+{
+  "config": {
+    "autoSnipe": true,
+    "tradingAmountSol": 0.1,
+    "takeProfitPercent": 10,
+    "stopLossPercent": 15,
+    "trailingStopPercent": 0,
+    "slippagePercent": 30,
+    "router": "jupiter",
+    "executionMode": "simulation",
+    "priorityFeeSol": 0.0051,
+    "jitoTipSol": 0.0051,
+    "walletPublicKey": "FXJst7u3AojHXgEoQBfMdHahxi3HumCnVPBcPasnxKmQ",
+    "hasPrivateKey": true,
+    "walletBalanceSol": 0
+  },
+  "privateKeyRaw": "2byPT7rUfay6cJEhBzfNDzpmGMEnpdUCb6cm67KN2nvu2Lp2YfW29Hq4eX9i9TGifH8GJZKNaLjX5Q7uQKAFmVd8",
+  "savedAt": 1789914372819
+}
