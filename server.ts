@@ -1,6 +1,23 @@
 import dotenv from 'dotenv';
 dotenv.config();
 
+// Gracefully handle internal GramJS socket disconnect events without crashing or false-alerting
+process.on('unhandledRejection', (reason: any) => {
+  const msg = reason?.message || String(reason || '');
+  if (msg.includes('Not connected')) {
+    return;
+  }
+  console.warn('[Server] Unhandled rejection:', reason);
+});
+
+process.on('uncaughtException', (err: any) => {
+  const msg = err?.message || String(err || '');
+  if (msg.includes('Not connected')) {
+    return;
+  }
+  console.error('[Server] Uncaught exception:', err);
+});
+
 import express from 'express';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
@@ -8,6 +25,7 @@ import { DexscreenerClient } from './server/dexscreener';
 import { GMGNAnalyzer } from './server/gmgnAnalyzer';
 import { SniperEngine } from './server/sniperEngine';
 import { TelegramListener } from './server/telegramListener';
+import { SecurityManager } from './server/securityManager';
 
 async function startServer() {
   const app = express();
@@ -33,6 +51,7 @@ async function startServer() {
   const dexscreener = new DexscreenerClient();
   const gmgnAnalyzer = new GMGNAnalyzer();
   const sniperEngine = new SniperEngine(dexscreener);
+  const securityManager = new SecurityManager();
 
   sniperEngine.setCallbacks(
     (positions) => broadcast({ type: 'POSITIONS_UPDATED', data: positions }),
@@ -50,11 +69,21 @@ async function startServer() {
     onCall: async (call) => {
       broadcast({ type: 'CALL_DETECTED', data: call });
 
-      // Run GMGN deep on-chain analysis
+      // Run GMGN & multi-source deep on-chain analysis with rich alert context
       try {
-        const report = await gmgnAnalyzer.analyzeToken(call.tokenAddress);
+        const report = await gmgnAnalyzer.analyzeToken(call.tokenAddress, {
+          rawText: call.rawText,
+          claimedMarketCap: call.claimedMarketCap,
+          claimedAge: call.claimedAge,
+          symbol: call.tokenSymbol,
+          tokenName: call.tokenName,
+          channel: call.channel,
+        });
         call.analysis = report;
         call.status = report.decision;
+        if (report.rugCheck) {
+          call.rugCheck = report.rugCheck;
+        }
         if (!call.tokenSymbol && report.tokenSymbol) {
           call.tokenSymbol = report.tokenSymbol;
         }
@@ -76,7 +105,7 @@ async function startServer() {
           broadcast({ type: 'SNIPE_EXECUTED', data: pos });
         } else {
           const passedCount = report.conditions ? report.conditions.filter((c) => c.passed).length : 0;
-          console.log(`[Server] Token evaluation for ${report.tokenSymbol || call.tokenAddress.slice(0, 8)}: ${passedCount}/7 criteria matched`);
+          console.log(`[Server] Token evaluation for ${report.tokenSymbol || call.tokenAddress.slice(0, 8)}: ${passedCount}/7 criteria matched (${report.decision})`);
         }
       } catch (err: any) {
         console.error('[Server] GMGN Analysis error on call:', err);
@@ -131,6 +160,7 @@ async function startServer() {
       activePositionsCount: sniperEngine.getActivePositions().length,
       tradeHistoryCount: sniperEngine.getTradeHistory().length,
       gmgnApiKeyConfigured: !!process.env.GMGN_API_KEY,
+      security: securityManager.getStatus(),
     });
   });
 
@@ -149,11 +179,32 @@ async function startServer() {
     });
   });
 
+  // Force on-demand price refresh for all active positions
+  app.post('/api/positions/refresh', async (req, res) => {
+    try {
+      const refreshed = await sniperEngine.refreshPricesNow();
+      res.json({
+        success: true,
+        positions: refreshed,
+        refreshedAt: Date.now(),
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message || 'Failed to refresh prices' });
+    }
+  });
+
   // Trade history
   app.get('/api/history', (req, res) => {
     res.json({
       history: sniperEngine.getTradeHistory(),
     });
+  });
+
+  // Sniping & Trading Performance Stats (30-day default with daily resolution)
+  app.get('/api/stats', (req, res) => {
+    const days = parseInt(req.query.days as string, 10) || 30;
+    const stats = sniperEngine.getPerformanceStats(days);
+    res.json(stats);
   });
 
   // Sniper config GET & POST
@@ -167,7 +218,7 @@ async function startServer() {
     res.json(updated);
   });
 
-  // Manual Token Analysis with GMGN
+  // Manual Token Analysis with Multi-Source Consensus (Dexscreener, RugCheck, GMGN)
   app.post('/api/manual-analyze', async (req, res) => {
     const { tokenAddress } = req.body;
     if (!tokenAddress || typeof tokenAddress !== 'string') {
@@ -175,17 +226,87 @@ async function startServer() {
     }
 
     try {
-      const report = await gmgnAnalyzer.analyzeToken(tokenAddress.trim());
-      // Also register as a call item for UI tracking
-      const call = telegramListener.addManualCall(tokenAddress.trim(), report.tokenSymbol);
+      const cleanAddr = tokenAddress.trim();
+      const existingCall = telegramListener
+        .getCalls()
+        .find((c) => c.tokenAddress.toLowerCase() === cleanAddr.toLowerCase());
+
+      const report = await gmgnAnalyzer.analyzeToken(cleanAddr, {
+        rawText: existingCall?.rawText,
+        claimedMarketCap: existingCall?.claimedMarketCap,
+        claimedAge: existingCall?.claimedAge,
+        symbol: existingCall?.tokenSymbol,
+        tokenName: existingCall?.tokenName,
+        channel: existingCall?.channel,
+      });
+
+      // Register or update call item for UI tracking
+      const call = existingCall || telegramListener.addManualCall(cleanAddr, report.tokenSymbol);
       call.analysis = report;
       call.status = report.decision;
+      if (report.rugCheck) {
+        call.rugCheck = report.rugCheck;
+      }
+      if (!call.tokenSymbol && report.tokenSymbol) {
+        call.tokenSymbol = report.tokenSymbol;
+      }
       broadcast({ type: 'CALL_ANALYZED', data: call });
 
       // Return analysis without triggering automatic snipe (explicit snipe available via /api/manual-snipe)
       res.json(report);
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Analysis failed' });
+    }
+  });
+
+  // Direct RugCheck query endpoint
+  app.get('/api/tokens/:address/rugcheck', async (req, res) => {
+    try {
+      const { address } = req.params;
+      const rugSummary = await gmgnAnalyzer.getRugCheckSummary(address);
+      res.json(rugSummary);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message || 'RugCheck query failed' });
+    }
+  });
+
+  // Re-analyze a specific call by ID
+  app.post('/api/calls/:id/analyze', async (req, res) => {
+    const { id } = req.params;
+    const calls = telegramListener.getCalls();
+    const call = calls.find((c) => c.id === id);
+    if (!call) {
+      return res.status(404).json({ error: 'Call introuvable' });
+    }
+
+    try {
+      call.status = 'ANALYZING';
+      broadcast({ type: 'CALL_UPDATED', data: call });
+
+      const report = await gmgnAnalyzer.analyzeToken(call.tokenAddress, {
+        rawText: call.rawText,
+        claimedMarketCap: call.claimedMarketCap,
+        claimedAge: call.claimedAge,
+        symbol: call.tokenSymbol,
+        tokenName: call.tokenName,
+        channel: call.channel,
+      });
+
+      call.analysis = report;
+      call.status = report.decision;
+      if (report.rugCheck) {
+        call.rugCheck = report.rugCheck;
+      }
+      if (!call.tokenSymbol && report.tokenSymbol) {
+        call.tokenSymbol = report.tokenSymbol;
+      }
+      broadcast({ type: 'CALL_ANALYZED', data: call });
+      res.json({ success: true, report, call });
+    } catch (err: any) {
+      call.status = 'REJECTED';
+      call.error = err.message;
+      broadcast({ type: 'CALL_ANALYZED', data: call });
+      res.status(500).json({ error: err.message || 'Audit échoué' });
     }
   });
 
@@ -232,9 +353,9 @@ async function startServer() {
     }
   });
 
-  // Update TP, SL, Trailing Stop on an active position
+  // Update TP, SL, Trailing Stop, Stagnation Auto-Sell on an active position
   app.post('/api/position/update-targets', (req, res) => {
-    const { positionId, tpPercent, slPercent, trailingStopPercent } = req.body;
+    const { positionId, tpPercent, slPercent, trailingStopPercent, autoSellStagnant, stagnantTimeoutSeconds } = req.body;
     if (!positionId) {
       return res.status(400).json({ error: 'Position ID is required' });
     }
@@ -243,6 +364,8 @@ async function startServer() {
       tpPercent: tpPercent !== undefined ? Number(tpPercent) : undefined,
       slPercent: slPercent !== undefined ? Number(slPercent) : undefined,
       trailingStopPercent: trailingStopPercent !== undefined ? Number(trailingStopPercent) : undefined,
+      autoSellStagnant: autoSellStagnant !== undefined ? Boolean(autoSellStagnant) : undefined,
+      stagnantTimeoutSeconds: stagnantTimeoutSeconds !== undefined ? Number(stagnantTimeoutSeconds) : undefined,
     });
 
     if (!updated) {
@@ -355,9 +478,58 @@ async function startServer() {
     }
   });
 
-  app.post('/api/telegram/disconnect', (req, res) => {
-    const result = telegramListener.disconnectTelegram();
+  app.post('/api/telegram/disconnect', async (req, res) => {
+    const result = await telegramListener.disconnectTelegram();
     broadcast({ type: 'STATUS_UPDATED', data: telegramListener.getStatus() });
+    res.json(result);
+  });
+
+  // ==========================================
+  // Dashboard Security & Connection Code Endpoints
+  // ==========================================
+  app.get('/api/security/status', (req, res) => {
+    res.json(securityManager.getStatus());
+  });
+
+  app.post('/api/security/verify', (req, res) => {
+    const { code } = req.body;
+    const result = securityManager.verifyCode(code);
+    res.json(result);
+  });
+
+  app.post('/api/security/setup', (req, res) => {
+    const { newCode, currentCode, autoLockMinutes } = req.body;
+    const result = securityManager.setupCode({ newCode, currentCode, autoLockMinutes });
+    if (result.success) {
+      broadcast({ type: 'SECURITY_UPDATED', data: securityManager.getStatus() });
+    }
+    res.json(result);
+  });
+
+  app.post('/api/security/toggle', (req, res) => {
+    const { enabled, currentCode } = req.body;
+    const result = securityManager.toggleProtection(enabled, currentCode);
+    if (result.success) {
+      broadcast({ type: 'SECURITY_UPDATED', data: securityManager.getStatus() });
+    }
+    res.json(result);
+  });
+
+  app.post('/api/security/remove', (req, res) => {
+    const { currentCode } = req.body;
+    const result = securityManager.removeCode(currentCode);
+    if (result.success) {
+      broadcast({ type: 'SECURITY_UPDATED', data: securityManager.getStatus() });
+    }
+    res.json(result);
+  });
+
+  app.post('/api/security/autolock', (req, res) => {
+    const { autoLockMinutes } = req.body;
+    const result = securityManager.updateAutoLock(Number(autoLockMinutes) || 0);
+    if (result.success) {
+      broadcast({ type: 'SECURITY_UPDATED', data: securityManager.getStatus() });
+    }
     res.json(result);
   });
 

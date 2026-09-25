@@ -45,6 +45,8 @@ export class TelegramListener {
   private channelStats: Record<string, number> = {};
   private channelErrors: Record<string, string> = {};
   private invalidChannels: Set<string> = new Set();
+  private eventHandlerRegistered: boolean = false;
+  private isConnecting: boolean = false;
 
   constructor(options: TelegramListenerOptions) {
     const rawChannels = options.channels || (options.channel ? [options.channel] : ['pumpdotfunalert']);
@@ -373,11 +375,22 @@ export class TelegramListener {
 
     try {
       const { TelegramClient } = await import('telegram');
-      const { StringSession } = await import('telegram/sessions');
+      const { StringSession } = await import('telegram/sessions/index.js');
+      const { Logger, LogLevel } = await import('telegram/extensions/Logger.js');
+
+      if (this.gramClient) {
+        try {
+          await this.gramClient.disconnect();
+        } catch {}
+        this.gramClient = null;
+      }
 
       const session = new StringSession('');
       this.gramClient = new TelegramClient(session, this.apiId, this.apiHash, {
-        connectionRetries: 3,
+        connectionRetries: 5,
+        autoReconnect: true,
+        useWSS: false,
+        baseLogger: new Logger(LogLevel.NONE),
       });
 
       await this.gramClient.connect();
@@ -415,6 +428,9 @@ export class TelegramListener {
     }
 
     try {
+      if (!this.gramClient.connected) {
+        await this.gramClient.connect();
+      }
       const { Api } = await import('telegram');
 
       let user: any = null;
@@ -435,6 +451,9 @@ export class TelegramListener {
         ) {
           if (password && password.trim()) {
             const { computeCheck } = await import('telegram/Password.js');
+            if (!this.gramClient.connected) {
+              await this.gramClient.connect();
+            }
             const passwordSrpResult = await this.gramClient.invoke(new Api.account.GetPassword());
             const passwordSrpCheck = await computeCheck(passwordSrpResult, password.trim());
             const checkResult = await this.gramClient.invoke(
@@ -466,6 +485,10 @@ export class TelegramListener {
       } catch (e) {
         console.warn('[TelegramListener] Error saving session string:', e);
       }
+
+      this.setupGramEventListener().catch((e) =>
+        console.warn('[TelegramListener] Event listener register note on sign-in:', e?.message || e)
+      );
 
       return {
         success: true,
@@ -507,10 +530,19 @@ export class TelegramListener {
     }
   }
 
-  public disconnectTelegram(): { success: boolean; message: string } {
+  public async disconnectTelegram(): Promise<{ success: boolean; message: string }> {
     this.isAuthenticated = false;
     this.authenticatedUser = undefined;
     this.phoneCodeHash = undefined;
+    this.eventHandlerRegistered = false;
+
+    if (this.gramClient) {
+      try {
+        await this.gramClient.disconnect();
+      } catch {}
+      this.gramClient = null;
+    }
+
     try {
       if (fs.existsSync(TG_DATA_FILE)) {
         fs.unlinkSync(TG_DATA_FILE);
@@ -522,8 +554,24 @@ export class TelegramListener {
   }
 
   private async ensureGramClientConnected(): Promise<boolean> {
-    if (this.gramClient) return true;
+    if (this.gramClient && this.gramClient.connected) return true;
+    if (this.isConnecting) return false;
+
     try {
+      this.isConnecting = true;
+      if (this.gramClient) {
+        try {
+          await this.gramClient.connect();
+          if (this.gramClient.connected) return true;
+        } catch {
+          try {
+            await this.gramClient.disconnect();
+          } catch {}
+          this.gramClient = null;
+          this.eventHandlerRegistered = false;
+        }
+      }
+
       let savedSession = '';
       if (fs.existsSync(TG_DATA_FILE)) {
         const raw = fs.readFileSync(TG_DATA_FILE, 'utf-8');
@@ -533,18 +581,184 @@ export class TelegramListener {
       if (!savedSession && process.env.TELEGRAM_SESSION_STRING) {
         savedSession = process.env.TELEGRAM_SESSION_STRING;
       }
+      if (!savedSession) return false;
+
       const { TelegramClient } = await import('telegram');
       const { StringSession } = await import('telegram/sessions/index.js');
+      const { Logger, LogLevel } = await import('telegram/extensions/Logger.js');
+
       const session = new StringSession(savedSession);
       this.gramClient = new TelegramClient(session, this.apiId, this.apiHash, {
-        connectionRetries: 3,
+        connectionRetries: 5,
+        autoReconnect: true,
+        useWSS: false,
+        baseLogger: new Logger(LogLevel.NONE),
       });
+
       await this.gramClient.connect();
+      if (!this.gramClient.connected) {
+        return false;
+      }
+
+      this.setupGramEventListener().catch((e) =>
+        console.warn('[TelegramListener] Event listener register note:', e?.message || e)
+      );
       return true;
-    } catch (err) {
-      console.warn('[TelegramListener] Could not reconnect GramJS client:', err);
+    } catch (err: any) {
+      console.warn('[TelegramListener] Could not reconnect GramJS client:', err?.message || err);
       return false;
+    } finally {
+      this.isConnecting = false;
     }
+  }
+
+  private async setupGramEventListener(): Promise<void> {
+    if (!this.gramClient || !this.isAuthenticated || this.eventHandlerRegistered) return;
+    try {
+      const { NewMessage } = await import('telegram/events/index.js');
+      this.gramClient.addEventHandler(async (event: any) => {
+        try {
+          const msg = event?.message;
+          if (!msg || !msg.message) return;
+
+          let channelName = '';
+          try {
+            const chat = await msg.getChat();
+            channelName = chat?.username || '';
+          } catch {}
+
+          const cleanTargetChannels = this.channels.map((c) =>
+            c.toLowerCase().replace(/^t\.me\//, '').replace(/^@/, '')
+          );
+          const cleanChatUsername = channelName
+            ? channelName.toLowerCase().replace(/^t\.me\//, '').replace(/^@/, '')
+            : '';
+
+          // Strictly filter: message MUST originate from one of our monitored channels!
+          if (!cleanChatUsername || !cleanTargetChannels.includes(cleanChatUsername)) {
+            return;
+          }
+
+          const messageTimestamp = msg.date ? msg.date * 1000 : Date.now();
+          const postSlug = `${cleanChatUsername}/${msg.id}`;
+          this.parseAndProcessMessage(msg.message, cleanChatUsername, postSlug, messageTimestamp, false);
+        } catch (e: any) {
+          console.warn('[TelegramListener] Realtime event process error:', e?.message || e);
+        }
+      }, new NewMessage({}));
+      this.eventHandlerRegistered = true;
+      console.log('[TelegramListener] ⚡ Real-time MTProto event listener active (sub-50ms push updates enabled)');
+    } catch (err: any) {
+      console.warn('[TelegramListener] Could not register GramJS event listener:', err?.message || err);
+    }
+  }
+
+  private parseAndProcessMessage(
+    cleanText: string,
+    channel: string,
+    postSlug: string,
+    messageTimestamp: number,
+    isInitial: boolean = false
+  ): TelegramCall | null {
+    if (!cleanText) return null;
+    if (this.processedPostIds.has(postSlug)) return null;
+    this.processedPostIds.add(postSlug);
+    this.saveProcessedPostsToDisk();
+
+    const tokenAddress = this.extractSolanaAddress(cleanText, '');
+    if (!tokenAddress) return null;
+
+    const messageAgeMs = Math.max(0, Date.now() - messageTimestamp);
+    const isHistorical =
+      isInitial ||
+      this.isInitialScan ||
+      messageTimestamp < this.botLaunchTime - 30_000 ||
+      messageAgeMs > 120_000;
+    const canAutoSnipe = !isHistorical;
+
+    const channelSlug = `t.me/${channel}`;
+    this.totalAlertsReceived++;
+    this.channelStats[channelSlug] = (this.channelStats[channelSlug] || 0) + 1;
+    if (this.channelErrors[channelSlug]) {
+      delete this.channelErrors[channelSlug];
+    }
+
+    let symbol: string | undefined;
+    const symbolMatch = cleanText.match(/Token:\s*\$?([A-Za-z0-9_]{2,14})/i);
+    if (symbolMatch) {
+      symbol = symbolMatch[1].toUpperCase();
+    } else {
+      const parenMatch = cleanText.match(/\(([A-Za-z0-9_]{2,14})\)/);
+      if (parenMatch) {
+        symbol = parenMatch[1].toUpperCase();
+      } else {
+        const dollarMatch = cleanText.match(/\$([A-Za-z0-9_]{2,14})/);
+        if (dollarMatch) {
+          symbol = dollarMatch[1].toUpperCase();
+        }
+      }
+    }
+
+    let tokenName: string | undefined;
+    const nameMatch = cleanText.match(/\$([A-Za-z0-9_]+)\(([^)]+)\)/);
+    if (nameMatch) {
+      tokenName = nameMatch[2].trim();
+      if (!symbol) symbol = nameMatch[1].toUpperCase();
+    }
+
+    const existingCall = this.calls.find(
+      (c) => c.tokenAddress.toLowerCase() === tokenAddress.toLowerCase()
+    );
+
+    if (existingCall) {
+      this.totalDuplicatesFiltered++;
+      if (!existingCall.channels) existingCall.channels = [existingCall.channel];
+      if (!existingCall.channels.includes(channelSlug)) {
+        existingCall.channels.push(channelSlug);
+      }
+      existingCall.callCount = (existingCall.callCount || 1) + 1;
+      existingCall.lastAlertTime = messageTimestamp;
+      if ((!existingCall.tokenSymbol || existingCall.tokenSymbol === 'UNKNOWN') && symbol) {
+        existingCall.tokenSymbol = symbol;
+      }
+      if (this.onCallUpdated) this.onCallUpdated(existingCall);
+      return existingCall;
+    }
+
+    const mcMatch = cleanText.match(/(?:MCP|MC|Market\s*Cap)\s*[≡:=]?\s*\$?([0-9.,]+[kmb]?)/i);
+    const claimedMarketCap = mcMatch ? mcMatch[1].replace(/\$/g, '').trim() : undefined;
+    const ageMatch = cleanText.match(/(?:Age\s*[≡:=]|⌛️|Open:\s*)([0-9]+[smhd]|(?:[0-9]+\s*s\s*ago))/i);
+    const claimedAge = ageMatch ? ageMatch[1].trim() : undefined;
+
+    const callItem: TelegramCall = {
+      id: `call_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+      messageId: postSlug,
+      channel: channelSlug,
+      channels: [channelSlug],
+      callCount: 1,
+      lastAlertTime: messageTimestamp,
+      timestamp: messageTimestamp,
+      rawText: cleanText,
+      tokenAddress,
+      tokenSymbol: symbol,
+      tokenName,
+      claimedMarketCap: claimedMarketCap ? `$${claimedMarketCap}` : undefined,
+      claimedAge,
+      status: isHistorical ? 'PENDING' : 'ANALYZING',
+      isHistorical,
+      canAutoSnipe,
+    };
+
+    this.calls.unshift(callItem);
+    if (this.calls.length > 150) this.calls.pop();
+    this.lastCallTime = Date.now();
+    console.log(
+      `[TelegramListener][${channel}][MTProto] ${
+        isHistorical ? 'HISTORICAL CALL ARCHIVED' : '⚡ LIVE NEW CALL DETECTED'
+      }: ${tokenAddress} (${symbol || 'UNKNOWN'}) [AutoSnipe: ${canAutoSnipe}]`
+    );
+    this.onCall(callItem);
+    return callItem;
   }
 
   private async fetchAllChannels(isInitial: boolean = false): Promise<void> {
@@ -572,106 +786,30 @@ export class TelegramListener {
   }
 
   private async fetchChannelWithGramClient(channel: string, isInitial: boolean = false): Promise<void> {
-    if (!this.gramClient || !this.isAuthenticated) return;
+    if (!this.gramClient || !this.isAuthenticated || !this.gramClient.connected) {
+      await this.fetchChannelPostsFor(channel, isInitial);
+      return;
+    }
     try {
       const messages = await this.gramClient.getMessages(channel, { limit: 15 });
-      if (!messages || !Array.isArray(messages)) return;
+      if (!messages || !Array.isArray(messages)) {
+        await this.fetchChannelPostsFor(channel, isInitial);
+        return;
+      }
 
       for (const msg of messages) {
         if (!msg || !msg.message) continue;
         const postSlug = `${channel}/${msg.id}`;
-        if (this.processedPostIds.has(postSlug)) continue;
-        this.processedPostIds.add(postSlug);
-        this.saveProcessedPostsToDisk();
-
-        const cleanText = msg.message;
-        const tokenAddress = this.extractSolanaAddress(cleanText, '');
-        if (!tokenAddress) continue;
-
-        // Calculate actual post timestamp
         const messageTimestamp = msg.date ? msg.date * 1000 : Date.now();
-        const messageAgeMs = Math.max(0, Date.now() - messageTimestamp);
-
-        // Strict guard: Call is historical if:
-        // 1. We are in the initial boot scan
-        // 2. The post date was prior to bot start time (minus 30s network grace)
-        // 3. The message is older than 2 minutes (120,000 ms)
-        const isHistorical = isInitial || this.isInitialScan || messageTimestamp < (this.botLaunchTime - 30_000) || messageAgeMs > 120_000;
-        const canAutoSnipe = !isHistorical;
-
-        const channelSlug = `t.me/${channel}`;
-        this.totalAlertsReceived++;
-        this.channelStats[channelSlug] = (this.channelStats[channelSlug] || 0) + 1;
-        if (this.channelErrors[channelSlug]) {
-          delete this.channelErrors[channelSlug];
-        }
-
-        let symbol: string | undefined;
-        const symbolMatch = cleanText.match(/Token:\s*\$?([A-Za-z0-9_]{2,14})/i);
-        if (symbolMatch) {
-          symbol = symbolMatch[1].toUpperCase();
-        } else {
-          const parenMatch = cleanText.match(/\(([A-Za-z0-9_]{2,14})\)/);
-          if (parenMatch) {
-            symbol = parenMatch[1].toUpperCase();
-          } else {
-            const dollarMatch = cleanText.match(/\$([A-Za-z0-9_]{2,14})/);
-            if (dollarMatch) {
-              symbol = dollarMatch[1].toUpperCase();
-            }
-          }
-        }
-
-        const existingCall = this.calls.find(
-          (c) => c.tokenAddress.toLowerCase() === tokenAddress.toLowerCase()
-        );
-
-        if (existingCall) {
-          this.totalDuplicatesFiltered++;
-          if (!existingCall.channels) existingCall.channels = [existingCall.channel];
-          if (!existingCall.channels.includes(channelSlug)) {
-            existingCall.channels.push(channelSlug);
-          }
-          existingCall.callCount = (existingCall.callCount || 1) + 1;
-          existingCall.lastAlertTime = messageTimestamp;
-          if ((!existingCall.tokenSymbol || existingCall.tokenSymbol === 'UNKNOWN') && symbol) {
-            existingCall.tokenSymbol = symbol;
-          }
-          if (this.onCallUpdated) this.onCallUpdated(existingCall);
-          continue;
-        }
-
-        const mcMatch = cleanText.match(/MC\s*[≡:=]\s*([^\n|]+)/i);
-        const claimedMarketCap = mcMatch ? mcMatch[1].replace(/\$/g, '').trim() : undefined;
-        const ageMatch = cleanText.match(/(?:Age\s*[≡:=]|⌛️)\s*([0-9]+[smhd])/i);
-        const claimedAge = ageMatch ? ageMatch[1].trim() : undefined;
-
-        const callItem: TelegramCall = {
-          id: `call_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-          messageId: postSlug,
-          channel: channelSlug,
-          channels: [channelSlug],
-          callCount: 1,
-          lastAlertTime: messageTimestamp,
-          timestamp: messageTimestamp,
-          rawText: cleanText,
-          tokenAddress,
-          tokenSymbol: symbol,
-          claimedMarketCap: claimedMarketCap ? `$${claimedMarketCap}` : undefined,
-          claimedAge,
-          status: isHistorical ? 'PENDING' : 'ANALYZING',
-          isHistorical,
-          canAutoSnipe,
-        };
-
-        this.calls.unshift(callItem);
-        if (this.calls.length > 150) this.calls.pop();
-        this.lastCallTime = Date.now();
-        console.log(`[TelegramListener][${channel}][MTProto] ${isHistorical ? 'HISTORICAL CALL ARCHIVED' : 'LIVE NEW CALL DETECTED'}: ${tokenAddress} (${symbol || 'UNKNOWN'}) [AutoSnipe: ${canAutoSnipe}]`);
-        this.onCall(callItem);
+        this.parseAndProcessMessage(msg.message, channel, postSlug, messageTimestamp, isInitial);
       }
     } catch (err: any) {
       const errMsg = err?.message || String(err);
+      if (errMsg.includes('Not connected')) {
+        await this.fetchChannelPostsFor(channel, isInitial);
+        return;
+      }
+
       const isEntityNotFound =
         /USERNAME_INVALID|No user has|Cannot find any entity|USERNAME_NOT_OCCUPIED|CHANNEL_INVALID|CHAT_ADMIN_REQUIRED|CHANNEL_PRIVATE/i.test(
           errMsg
@@ -773,110 +911,7 @@ export class TelegramListener {
         }
       }
 
-      const messageAgeMs = Math.max(0, Date.now() - messageTimestamp);
-      // Strictly prevent old calls from ever triggering auto-snipe:
-      // 1. Initial boot scan
-      // 2. Message was posted before bot launch time (minus 30s network grace)
-      // 3. Message is older than 2 minutes (120 seconds)
-      const isHistorical = isInitial || this.isInitialScan || messageTimestamp < (this.botLaunchTime - 30_000) || messageAgeMs > 120_000;
-      const canAutoSnipe = !isHistorical;
-
-      const channelSlug = `t.me/${channel}`;
-      this.totalAlertsReceived++;
-      this.channelStats[channelSlug] = (this.channelStats[channelSlug] || 0) + 1;
-
-      // Extract token symbol:
-      // Pattern 1: Token: $XYZ or Token: XYZ
-      // Pattern 2: Name (SYMBOL) NEW ALERT (pumpdotfunalert format)
-      // Pattern 3: $SYMBOL
-      let symbol: string | undefined;
-
-      const symbolMatch = cleanText.match(/Token:\s*\$?([A-Za-z0-9_]{2,14})/i);
-      if (symbolMatch) {
-        symbol = symbolMatch[1].toUpperCase();
-      } else {
-        const parenMatch = cleanText.match(/\(([A-Za-z0-9_]{2,14})\)/);
-        if (parenMatch) {
-          symbol = parenMatch[1].toUpperCase();
-        } else {
-          const dollarMatch = cleanText.match(/\$([A-Za-z0-9_]{2,14})/);
-          if (dollarMatch) {
-            symbol = dollarMatch[1].toUpperCase();
-          }
-        }
-      }
-
-      // Check if this token address has already been detected (DEDUPLICATION)
-      const existingCall = this.calls.find(
-        (c) => c.tokenAddress.toLowerCase() === tokenAddress.toLowerCase()
-      );
-
-      if (existingCall) {
-        this.totalDuplicatesFiltered++;
-
-        // Ensure channels list contains this channel
-        if (!existingCall.channels) {
-          existingCall.channels = [existingCall.channel];
-        }
-        if (!existingCall.channels.includes(channelSlug)) {
-          existingCall.channels.push(channelSlug);
-          console.log(
-            `[TelegramListener] Dual-channel alert! ${existingCall.tokenSymbol || tokenAddress.slice(0, 8)} detected in BOTH ${existingCall.channels.join(' & ')}`
-          );
-        }
-
-        existingCall.callCount = (existingCall.callCount || 1) + 1;
-        existingCall.lastAlertTime = messageTimestamp;
-        if ((!existingCall.tokenSymbol || existingCall.tokenSymbol === 'UNKNOWN') && symbol) {
-          existingCall.tokenSymbol = symbol;
-        }
-
-        // Broadcast update to front-end so channels badges & alert count stay up-to-date
-        if (this.onCallUpdated) {
-          this.onCallUpdated(existingCall);
-        }
-
-        // Stop here: eliminate duplicate snipe & duplicate GMGN analysis
-        continue;
-      }
-
-      // Extract MC claim, e.g. MC ≡ $91k or MC: $35.2K
-      const mcMatch = cleanText.match(/MC\s*[≡:=]\s*([^\n|]+)/i);
-      const claimedMarketCap = mcMatch ? mcMatch[1].replace(/\$/g, '').trim() : undefined;
-
-      // Extract Age claim, e.g. Age ≡ 5m or ⌛️ 14m
-      const ageMatch = cleanText.match(/(?:Age\s*[≡:=]|⌛️)\s*([0-9]+[smhd])/i);
-      const claimedAge = ageMatch ? ageMatch[1].trim() : undefined;
-
-      const callItem: TelegramCall = {
-        id: `call_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-        messageId: postSlug,
-        channel: channelSlug,
-        channels: [channelSlug],
-        callCount: 1,
-        lastAlertTime: messageTimestamp,
-        timestamp: messageTimestamp,
-        rawText: cleanText,
-        tokenAddress,
-        tokenSymbol: symbol,
-        claimedMarketCap: claimedMarketCap ? `$${claimedMarketCap}` : undefined,
-        claimedAge,
-        status: isHistorical ? 'PENDING' : 'ANALYZING',
-        isHistorical,
-        canAutoSnipe,
-      };
-
-      this.calls.unshift(callItem);
-      // Keep max 150 in memory
-      if (this.calls.length > 150) {
-        this.calls.pop();
-      }
-
-      this.lastCallTime = Date.now();
-      console.log(`[TelegramListener][${channel}] ${isHistorical ? 'HISTORICAL CALL ARCHIVED' : 'LIVE NEW CALL DETECTED'}: ${tokenAddress} (${symbol || 'UNKNOWN'}) [AutoSnipe: ${canAutoSnipe}]`);
-
-      // Invoke callback for GMGN analysis and potential auto-snipe
-      this.onCall(callItem);
+      this.parseAndProcessMessage(cleanText, channel, postSlug, messageTimestamp, isInitial);
     }
   }
 

@@ -6,8 +6,12 @@ import { ManualAnalyzer } from './components/ManualAnalyzer';
 import { SniperSettings } from './components/SniperSettings';
 import { TelegramFeed } from './components/TelegramFeed';
 import { TradeHistory } from './components/TradeHistory';
+import { SniperStats } from './components/SniperStats';
+import { DashboardLockScreen } from './components/DashboardLockScreen';
+import { SecuritySettingsModal } from './components/SecuritySettingsModal';
 import {
   ActivePosition,
+  SecurityStatus,
   SniperConfig,
   TelegramCall,
   TelegramStatus,
@@ -21,6 +25,8 @@ const DEFAULT_CONFIG: SniperConfig = {
   stopLossPercent: 15,
   trailingStopPercent: 10,
   slippagePercent: 5,
+  maxRugCheckScore: 800,
+  rejectOnRugCheckDanger: true,
   router: 'jupiter',
   executionMode: 'simulation',
   priorityFeeSol: 0.005,
@@ -48,9 +54,14 @@ export default function App() {
   const [history, setHistory] = useState<TradeHistoryItem[]>([]);
   const [telegramStatus, setTelegramStatus] = useState<TelegramStatus | null>(null);
   const [selectedCall, setSelectedCall] = useState<TelegramCall | null>(null);
-  const [activeTab, setActiveTab] = useState<'stream' | 'positions' | 'history' | 'settings'>('stream');
+  const [activeTab, setActiveTab] = useState<'stream' | 'positions' | 'history' | 'stats' | 'settings'>('stream');
   const [isManualAnalyzing, setIsManualAnalyzing] = useState(false);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+
+  // Dashboard Security & Access Code State
+  const [securityStatus, setSecurityStatus] = useState<SecurityStatus | null>(null);
+  const [isLocked, setIsLocked] = useState<boolean>(false);
+  const [isSecurityModalOpen, setIsSecurityModalOpen] = useState(false);
 
   const [config, setConfig] = useState<SniperConfig>(getStoredConfig);
 
@@ -127,8 +138,21 @@ export default function App() {
         saveConfig(configData);
       }
 
-      if (statusData && statusData.telegram) {
-        setTelegramStatus(statusData.telegram);
+      if (statusData) {
+        if (statusData.telegram) {
+          setTelegramStatus(statusData.telegram);
+        }
+        if (statusData.security) {
+          setSecurityStatus(statusData.security);
+          if (statusData.security.enabled) {
+            const token =
+              localStorage.getItem('solana_sniper_auth_token') ||
+              sessionStorage.getItem('solana_sniper_auth_token');
+            if (!token) {
+              setIsLocked(true);
+            }
+          }
+        }
       }
 
       // If all responses were null (e.g. server starting up), retry gently
@@ -234,6 +258,15 @@ export default function App() {
           case 'STATUS_UPDATED': {
             if (payload.data) {
               setTelegramStatus(payload.data);
+            }
+            break;
+          }
+          case 'SECURITY_UPDATED': {
+            if (payload.data) {
+              setSecurityStatus(payload.data);
+              if (!payload.data.enabled) {
+                setIsLocked(false);
+              }
             }
             break;
           }
@@ -411,7 +444,13 @@ export default function App() {
 
   const handleUpdatePositionTargets = async (
     positionId: string,
-    targets: { tpPercent?: number; slPercent?: number; trailingStopPercent?: number }
+    targets: {
+      tpPercent?: number;
+      slPercent?: number;
+      trailingStopPercent?: number;
+      autoSellStagnant?: boolean;
+      stagnantTimeoutSeconds?: number;
+    }
   ) => {
     try {
       const res = await fetch('/api/position/update-targets', {
@@ -421,7 +460,7 @@ export default function App() {
       });
       const data = await res.json();
       if (res.ok && data.success) {
-        showToast('🎯 Objectifs de la position mis à jour');
+        showToast('🎯 Objectifs & Auto-Sell mis à jour');
         setPositions((prev) =>
           prev.map((p) => (p.id === positionId ? { ...p, ...data.position } : p))
         );
@@ -470,6 +509,23 @@ export default function App() {
     } catch (err: any) {
       showToast(`Erreur réseau : ${err.message}`);
       return { success: false, message: err.message };
+    }
+  };
+
+  const handleReanalyzeCall = async (call: TelegramCall) => {
+    try {
+      showToast(`Audit multi-sources en cours pour $${call.tokenSymbol || call.tokenAddress.slice(0, 6)}...`);
+      const res = await fetch(`/api/calls/${encodeURIComponent(call.id)}/analyze`, { method: 'POST' });
+      const data = await res.json();
+      if (data.success && data.call) {
+        setCalls((prev) => prev.map((c) => (c.id === call.id ? data.call : c)));
+        setSelectedCall(data.call);
+        showToast(`Audit terminé : ${data.report?.decision || 'OK'}`);
+      } else {
+        showToast(`Erreur audit : ${data.error || 'Échec'}`);
+      }
+    } catch (err: any) {
+      showToast(`Erreur réseau : ${err.message}`);
     }
   };
 
@@ -526,6 +582,72 @@ export default function App() {
     }
   };
 
+  const handleForceRefreshPositions = async () => {
+    try {
+      const res = await fetch('/api/positions/refresh', { method: 'POST' });
+      const data = await res.json();
+      if (data.positions) {
+        setPositions(data.positions);
+        showToast('✓ Cours actualisés en direct depuis DexScreener');
+      }
+    } catch (err: any) {
+      showToast(`Erreur actualisation : ${err.message}`);
+    }
+  };
+
+  // Auto-lock inactivity timer
+  useEffect(() => {
+    if (!securityStatus?.enabled || !securityStatus.autoLockMinutes || securityStatus.autoLockMinutes <= 0 || isLocked) {
+      return;
+    }
+
+    const timeoutMs = securityStatus.autoLockMinutes * 60 * 1000;
+    let timer: any;
+
+    const resetTimer = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        setIsLocked(true);
+        try {
+          localStorage.removeItem('solana_sniper_auth_token');
+          sessionStorage.removeItem('solana_sniper_auth_token');
+        } catch {}
+        showToast('Dashboard verrouillé suite à inactivité');
+      }, timeoutMs);
+    };
+
+    resetTimer();
+
+    const events = ['mousemove', 'keydown', 'mousedown', 'touchstart', 'scroll'];
+    events.forEach((evt) => window.addEventListener(evt, resetTimer));
+
+    return () => {
+      clearTimeout(timer);
+      events.forEach((evt) => window.removeEventListener(evt, resetTimer));
+    };
+  }, [securityStatus, isLocked]);
+
+  const handleUnlockSuccess = (token: string, remember: boolean) => {
+    try {
+      if (remember) {
+        localStorage.setItem('solana_sniper_auth_token', token);
+      } else {
+        sessionStorage.setItem('solana_sniper_auth_token', token);
+      }
+    } catch {}
+    setIsLocked(false);
+    showToast('✓ Dashboard streaming déverrouillé');
+  };
+
+  const handleLockDashboard = () => {
+    try {
+      localStorage.removeItem('solana_sniper_auth_token');
+      sessionStorage.removeItem('solana_sniper_auth_token');
+    } catch {}
+    setIsLocked(true);
+    showToast('Dashboard streaming verrouillé');
+  };
+
   const totalPnlUsd = positions.reduce((acc, p) => acc + (p.pnlUsd || 0), 0);
 
   return (
@@ -539,6 +661,9 @@ export default function App() {
         totalCallsCount={calls.length}
         totalPnlUsd={totalPnlUsd}
         onOpenSettings={() => setActiveTab('settings')}
+        securityStatus={securityStatus}
+        onLockDashboard={handleLockDashboard}
+        onOpenSecurityModal={() => setIsSecurityModalOpen(true)}
       />
 
       {/* Main Content Container */}
@@ -577,6 +702,16 @@ export default function App() {
               Trade Log ({history.length})
             </button>
             <button
+              onClick={() => setActiveTab('stats')}
+              className={`px-3.5 py-1.5 text-xs font-mono font-semibold rounded uppercase tracking-wider transition-colors cursor-pointer ${
+                activeTab === 'stats'
+                  ? 'bg-white text-black'
+                  : 'bg-zinc-950 text-zinc-400 hover:text-white border border-zinc-900'
+              }`}
+            >
+              Stats (30J)
+            </button>
+            <button
               onClick={() => setActiveTab('settings')}
               className={`px-3.5 py-1.5 text-xs font-mono font-semibold rounded uppercase tracking-wider transition-colors cursor-pointer ${
                 activeTab === 'settings'
@@ -593,6 +728,7 @@ export default function App() {
             <span>TP: <strong className="text-white">{config.takeProfitPercent > 0 ? `+${config.takeProfitPercent}%` : 'Off'}</strong></span>
             <span>SL: <strong className="text-zinc-300">{config.stopLossPercent > 0 ? `-${config.stopLossPercent}%` : 'Off'}</strong></span>
             <span>Trailing: <strong className={config.trailingStopPercent > 0 ? 'text-amber-300' : 'text-zinc-500'}>{config.trailingStopPercent > 0 ? `-${config.trailingStopPercent}%` : 'Off'}</strong></span>
+            <span>Stagnation: <strong className={config.autoSellStagnant !== false ? 'text-amber-300' : 'text-zinc-500'}>{config.autoSellStagnant !== false ? `${Math.round((config.stagnantTimeoutSeconds || 180) / 60)}m` : 'Off'}</strong></span>
           </div>
         </div>
 
@@ -612,6 +748,7 @@ export default function App() {
                 onChannelsUpdated={(updated) => setTelegramStatus(updated)}
                 onSelectCall={(call) => setSelectedCall(call)}
                 onManualSnipe={handleManualSnipe}
+                onReanalyzeCall={handleReanalyzeCall}
               />
             </div>
             <div>
@@ -619,6 +756,7 @@ export default function App() {
                 positions={positions}
                 onSellPosition={handleSellPosition}
                 onUpdateTargets={handleUpdatePositionTargets}
+                onForceRefresh={handleForceRefreshPositions}
               />
             </div>
           </div>
@@ -630,6 +768,7 @@ export default function App() {
               positions={positions}
               onSellPosition={handleSellPosition}
               onUpdateTargets={handleUpdatePositionTargets}
+              onForceRefresh={handleForceRefreshPositions}
             />
           </div>
         )}
@@ -640,17 +779,26 @@ export default function App() {
           </div>
         )}
 
+        {activeTab === 'stats' && (
+          <div className="max-w-7xl mx-auto">
+            <SniperStats history={history} calls={calls} />
+          </div>
+        )}
+
         {activeTab === 'settings' && (
           <div className="max-w-3xl mx-auto">
             <SniperSettings
               config={config}
               status={telegramStatus}
+              securityStatus={securityStatus}
               onUpdateConfig={handleUpdateConfig}
               onRequestTelegramCode={handleRequestTelegramCode}
               onVerifyTelegramCode={handleVerifyTelegramCode}
               onImportPrivateKey={handleImportPrivateKey}
               onRefreshWalletBalance={handleRefreshBalance}
               onDisconnectTelegram={handleDisconnectTelegram}
+              onOpenSecurityModal={() => setIsSecurityModalOpen(true)}
+              onLockDashboard={handleLockDashboard}
             />
           </div>
         )}
@@ -662,6 +810,32 @@ export default function App() {
           call={selectedCall}
           onClose={() => setSelectedCall(null)}
           onManualSnipe={handleManualSnipe}
+        />
+      )}
+
+      {/* Security & Access Code Modal */}
+      {isSecurityModalOpen && (
+        <SecuritySettingsModal
+          isOpen={isSecurityModalOpen}
+          onClose={() => setIsSecurityModalOpen(false)}
+          securityStatus={securityStatus || { enabled: false, hasCodeSet: false, autoLockMinutes: 0 }}
+          onStatusUpdated={(updated) => {
+            setSecurityStatus(updated);
+            if (!updated.enabled) {
+              setIsLocked(false);
+            }
+          }}
+          onShowToast={showToast}
+        />
+      )}
+
+      {/* Dashboard Full Lock Screen */}
+      {isLocked && (
+        <DashboardLockScreen
+          securityStatus={securityStatus || { enabled: false, hasCodeSet: false, autoLockMinutes: 0 }}
+          onUnlockSuccess={handleUnlockSuccess}
+          onOpenSetupModal={() => setIsSecurityModalOpen(true)}
+          onBypassIfNoCode={() => setIsLocked(false)}
         />
       )}
 

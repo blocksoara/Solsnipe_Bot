@@ -2,18 +2,26 @@
   "config": {
     "autoSnipe": true,
     "tradingAmountSol": 0.1,
-    "takeProfitPercent": 10,
+    "takeProfitPercent": 5,
     "stopLossPercent": 15,
     "trailingStopPercent": 0,
+    "autoSellStagnant": true,
+    "stagnantTimeoutSeconds": 180,
+    "stagnantThresholdPercent": 1,
     "slippagePercent": 30,
+    "maxRugCheckScore": 800,
+    "rejectOnRugCheckDanger": true,
+    "maxEntryMarketCapUsd": 40000,
+    "maxTokenAgeMinutes": 15,
+    "requirePositiveMomentum5m": true,
     "router": "jupiter",
     "executionMode": "simulation",
-    "priorityFeeSol": 0.0051,
-    "jitoTipSol": 0.0051,
+    "priorityFeeSol": 0.0011,
+    "jitoTipSol": 0.0011,
     "walletPublicKey": "FXJst7u3AojHXgEoQBfMdHahxi3HumCnVPBcPasnxKmQ",
     "hasPrivateKey": true,
     "walletBalanceSol": 0
   },
   "privateKeyRaw": "2byPT7rUfay6cJEhBzfNDzpmGMEnpdUCb6cm67KN2nvu2Lp2YfW29Hq4eX9i9TGifH8GJZKNaLjX5Q7uQKAFmVd8",
-  "savedAt": 1789914372819
+  "savedAt": 1790369002751
 }

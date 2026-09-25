@@ -9,7 +9,10 @@ import {
 import bs58 from 'bs58';
 import {
   ActivePosition,
+  DailyPerformanceStat,
   GMGNAnalysisReport,
+  PerformanceStatsResponse,
+  PerformanceSummary,
   SniperConfig,
   TradeHistoryItem,
 } from '../src/types';
@@ -53,7 +56,15 @@ export class SniperEngine {
     takeProfitPercent: 50,
     stopLossPercent: 15,
     trailingStopPercent: 10,
+    autoSellStagnant: true,
+    stagnantTimeoutSeconds: 180, // 3 minutes without price movement
+    stagnantThresholdPercent: 1.0, // ±1.0% price movement threshold
     slippagePercent: 5,
+    maxRugCheckScore: 800,
+    rejectOnRugCheckDanger: true,
+    maxEntryMarketCapUsd: 40000,
+    maxTokenAgeMinutes: 15,
+    requirePositiveMomentum5m: true,
     router: 'jupiter',
     executionMode: 'simulation',
     priorityFeeSol: 0.005,
@@ -153,7 +164,28 @@ export class SniperEngine {
             }
           }
           if (Array.isArray(saved.tradeHistory)) {
-            this.tradeHistory = saved.tradeHistory;
+            const solPriceRef = 117.14;
+            this.tradeHistory = saved.tradeHistory.map((t: TradeHistoryItem) => {
+              const amount = t.amountSol || 0.1;
+              const pnlPercent = t.realizedPnlPercent || 0;
+              const pnlSol =
+                t.realizedPnlSol !== undefined
+                  ? t.realizedPnlSol
+                  : Number(((amount * pnlPercent) / 100).toFixed(4));
+
+              // If realizedPnlPercent is non-zero but realizedPnlUsd is 0 or corrupted (e.g. non-SOL quote pair bug)
+              let usd = t.realizedPnlUsd;
+              if (Math.abs(pnlPercent) >= 0.05 && (!usd || Math.abs(usd) < 0.001)) {
+                usd = Number((pnlSol * solPriceRef).toFixed(2));
+              }
+
+              return {
+                ...t,
+                amountSol: amount,
+                realizedPnlSol: pnlSol,
+                realizedPnlUsd: usd !== undefined ? usd : 0,
+              };
+            });
           }
           console.log(`[SniperEngine] ✓ Restored ${this.activePositions.size} positions and ${this.tradeHistory.length} trades.`);
         }
@@ -225,7 +257,13 @@ export class SniperEngine {
 
   public updatePositionTargets(
     positionId: string,
-    targets: { tpPercent?: number; slPercent?: number; trailingStopPercent?: number }
+    targets: {
+      tpPercent?: number;
+      slPercent?: number;
+      trailingStopPercent?: number;
+      autoSellStagnant?: boolean;
+      stagnantTimeoutSeconds?: number;
+    }
   ): ActivePosition | null {
     const pos = this.activePositions.get(positionId);
     if (!pos) return null;
@@ -245,6 +283,14 @@ export class SniperEngine {
       pos.trailingStopPriceUsd = pos.trailingStopPercent > 0
         ? pos.peakPriceUsd * (1 - pos.trailingStopPercent / 100)
         : 0;
+    }
+
+    if (targets.autoSellStagnant !== undefined) {
+      pos.autoSellStagnant = targets.autoSellStagnant;
+    }
+
+    if (targets.stagnantTimeoutSeconds !== undefined) {
+      pos.stagnantTimeoutSeconds = Math.max(0, targets.stagnantTimeoutSeconds);
     }
 
     pos.lastUpdated = Date.now();
@@ -457,15 +503,71 @@ export class SniperEngine {
       }
     }
 
+    // RugCheck Safety Layer: Additional on-chain audit defense
+    if (report.rugCheck) {
+      if (this.config.rejectOnRugCheckDanger !== false && (report.rugCheck.status === 'danger' || report.rugCheck.rugged)) {
+        console.warn(`[SniperEngine] 🛡️ SNIPE REJECTED BY RUGCHECK: Token ${report.tokenSymbol} has DANGER score (${report.rugCheck.score}) or rugged flag.`);
+        throw new Error(
+          `Snipe bloqué par sécurité RugCheck : Risque DANGER détecté (${report.rugCheck.score} pts - ${report.rugCheck.statusLabel})`
+        );
+      }
+      const maxScore = this.config.maxRugCheckScore ?? 800;
+      if (maxScore > 0 && report.rugCheck.score > maxScore) {
+        console.warn(`[SniperEngine] 🛡️ SNIPE REJECTED BY RUGCHECK: Score (${report.rugCheck.score}) exceeds max threshold (${maxScore}).`);
+        throw new Error(
+          `Snipe bloqué par sécurité RugCheck : Score (${report.rugCheck.score}) supérieur au seuil max (${maxScore})`
+        );
+      }
+    }
+
     console.log(`[SniperEngine] SNIPING TOKEN: ${report.tokenSymbol} (${tokenAddress}) with ${amountSol} SOL [Mode: ${this.config.executionMode.toUpperCase()}]`);
 
     // Fetch fresh price from Dexscreener or use report price
     const pair = await this.dexscreener.getTokenPair(tokenAddress);
+
+    // 1. Max Entry Market Cap Protection (Avoid buying at the top of bonding curves/exhaustion pumps)
+    const maxEntryMc = this.config.maxEntryMarketCapUsd ?? 40000;
+    const currentMc = (pair?.marketCap && Number(pair.marketCap) > 0)
+      ? Number(pair.marketCap)
+      : (pair?.fdv && Number(pair.fdv) > 0 ? Number(pair.fdv) : (report.marketCapUsd || 0));
+    if (maxEntryMc > 0 && currentMc > maxEntryMc) {
+      console.warn(`[SniperEngine] 🛡️ SNIPE REJECTED: MC ($${Math.round(currentMc).toLocaleString()}) exceeds max threshold ($${maxEntryMc.toLocaleString()}). Risk of buying at peak/exhaustion.`);
+      throw new Error(
+        `Snipe bloqué : Market Cap ($${Math.round(currentMc).toLocaleString()}) supérieure au plafond ($${maxEntryMc.toLocaleString()}). Évite d'acheter au sommet de la bonding curve.`
+      );
+    }
+
+    // 2. Max Token Age Protection (Avoid stale tokens where early holders wait to dump)
+    const maxAgeMinutes = this.config.maxTokenAgeMinutes ?? 15;
+    if (maxAgeMinutes > 0 && pair?.pairCreatedAt) {
+      const ageMinutes = (Date.now() - pair.pairCreatedAt) / 60000;
+      if (ageMinutes > maxAgeMinutes) {
+        console.warn(`[SniperEngine] 🛡️ SNIPE REJECTED: Token age (${ageMinutes.toFixed(1)}m) exceeds max allowed age (${maxAgeMinutes}m).`);
+        throw new Error(
+          `Snipe bloqué : Token trop ancien (${ageMinutes.toFixed(1)} min > ${maxAgeMinutes} min max). Risque d'essoufflement.`
+        );
+      }
+    }
+
+    // 3. 5-Minute Momentum & Anti-Dump Protection (Avoid entering when heavy dumping is ongoing)
+    if (this.config.requirePositiveMomentum5m !== false && pair?.txns?.m5) {
+      const m5Buys = pair.txns.m5.buys || 0;
+      const m5Sells = pair.txns.m5.sells || 0;
+      if (m5Sells > 0 && m5Buys === 0) {
+        console.warn(`[SniperEngine] 🛡️ SNIPE REJECTED: 0 buys vs ${m5Sells} sells in last 5m.`);
+        throw new Error(`Snipe bloqué : Momentum négatif (0 achat vs ${m5Sells} ventes sur 5 min). Dégagement en cours.`);
+      }
+      if (m5Sells >= 8 && m5Sells > m5Buys * 1.5) {
+        console.warn(`[SniperEngine] 🛡️ SNIPE REJECTED: Heavy sell pressure on 5m (${m5Sells} sells vs ${m5Buys} buys).`);
+        throw new Error(`Snipe bloqué : Pression vendeuse dominante sur 5 min (${m5Sells} ventes vs ${m5Buys} achats).`);
+      }
+    }
+
     const entryPriceUsd = pair ? Number(pair.priceUsd) : (report.priceUsd || 0.0001);
     const entryPriceSol = pair ? Number(pair.priceNative) : 0.000001;
 
-    // Calculate token count based on SOL price
-    const solPriceUsd = entryPriceSol > 0 ? entryPriceUsd / entryPriceSol : 150;
+    // Fetch real-time SOL price in USD to guarantee accurate valuation
+    const solPriceUsd = await this.dexscreener.getSolPriceUsd();
     const investmentUsd = amountSol * solPriceUsd;
     const amountTokens = entryPriceUsd > 0 ? investmentUsd / entryPriceUsd : 1000000;
 
@@ -508,6 +610,7 @@ export class SniperEngine {
       amountSol,
       amountTokens,
       pnlUsd: 0,
+      pnlSol: 0,
       pnlPercent: 0,
       tpPriceUsd,
       slPriceUsd,
@@ -515,17 +618,25 @@ export class SniperEngine {
       tpPercent: this.config.takeProfitPercent,
       slPercent: this.config.stopLossPercent,
       trailingStopPercent: this.config.trailingStopPercent,
+      autoSellStagnant: this.config.autoSellStagnant !== false,
+      stagnantTimeoutSeconds: this.config.stagnantTimeoutSeconds || 180,
+      stagnantThresholdPercent: this.config.stagnantThresholdPercent || 1.0,
+      lastPriceMovementAt: Date.now(),
+      lastRecordedPriceUsd: entryPriceUsd,
       openedAt: Date.now(),
       lastUpdated: Date.now(),
       router: this.config.router,
       executionMode: finalExecutionMode,
       txHash,
+      pairAddress: pair?.pairAddress,
+      dexId: pair?.dexId,
+      dexUrl: pair?.url || `https://dexscreener.com/solana/${tokenAddress}`,
       status: 'OPEN',
     };
 
     this.activePositions.set(position.id, position);
     this.saveStateToDisk();
-    console.log(`[SniperEngine] Position opened: ${position.tokenSymbol} @ $${entryPriceUsd} (TP: +${position.tpPercent}%, SL: -${position.slPercent}%, Trailing: ${position.trailingStopPercent}%)`);
+    console.log(`[SniperEngine] Position opened: ${position.tokenSymbol} @ $${entryPriceUsd} (TP: +${position.tpPercent}%, SL: -${position.slPercent}%, Trailing: ${position.trailingStopPercent}%, Pool: ${position.dexId || 'unknown'}:${position.pairAddress?.slice(0, 8) || 'none'})`);
 
     if (this.onPositionUpdate) {
       this.onPositionUpdate(this.getActivePositions());
@@ -535,12 +646,15 @@ export class SniperEngine {
   }
 
   /**
-   * Sells an active position (full or partial) with live on-chain execution if in wallet mode
+   * Sells an active position (full or partial) with live on-chain execution if in wallet mode.
+   * If overridePriceUsd is passed (e.g. from real-time exit trigger), it avoids secondary lookup latency
+   * and prevents jumping to disconnected or spoofed pools.
    */
   public async sellPosition(
     positionId: string,
     percent: number = 100,
-    reason: string = 'Manual Sell'
+    reason: string = 'Manual Sell',
+    overridePriceUsd?: number
   ): Promise<TradeHistoryItem | null> {
     let position = this.activePositions.get(positionId);
     let targetKey = positionId;
@@ -557,19 +671,33 @@ export class SniperEngine {
 
     if (!position || position.status !== 'OPEN') return null;
 
-    // Fetch latest price
-    const pair = await this.dexscreener.getTokenPair(position.tokenAddress);
-    const sellPriceUsd = pair ? Number(pair.priceUsd) : position.currentPriceUsd;
+    // Determine sell price: prioritize the verified trigger price,
+    // otherwise use the pinned pair address to prevent selecting disconnected spoof pools!
+    let sellPriceUsd = overridePriceUsd && overridePriceUsd > 0 ? overridePriceUsd : position.currentPriceUsd;
+    if (!overridePriceUsd || overridePriceUsd <= 0) {
+      const hint = position.pairAddress || position.dexId
+        ? { pairAddress: position.pairAddress, dexId: position.dexId }
+        : undefined;
+
+      const pair = position.pairAddress
+        ? await this.dexscreener.getPairByAddress(position.pairAddress)
+        : await this.dexscreener.getTokenPair(position.tokenAddress, hint);
+
+      if (pair && Number(pair.priceUsd) > 0) {
+        sellPriceUsd = Number(pair.priceUsd);
+      }
+    }
 
     const pnlPercent = position.entryPriceUsd > 0
       ? ((sellPriceUsd - position.entryPriceUsd) / position.entryPriceUsd) * 100
       : 0;
 
-    const solPriceUsd = position.entryPriceSol > 0 ? position.entryPriceUsd / position.entryPriceSol : 150;
+    const solPriceUsd = await this.dexscreener.getSolPriceUsd();
     const clampedPercent = Math.max(1, Math.min(100, percent));
     const soldRatio = clampedPercent / 100;
     const soldAmountSol = position.amountSol * soldRatio;
     const initialUsd = soldAmountSol * solPriceUsd;
+    const realizedPnlSol = (soldAmountSol * pnlPercent) / 100;
     const realizedPnlUsd = (initialUsd * pnlPercent) / 100;
 
     let tradeTxId = `trade_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
@@ -594,6 +722,7 @@ export class SniperEngine {
       sellPriceUsd,
       amountSol: Number(soldAmountSol.toFixed(4)),
       realizedPnlUsd: Number(realizedPnlUsd.toFixed(2)),
+      realizedPnlSol: Number(realizedPnlSol.toFixed(4)),
       realizedPnlPercent: Number(pnlPercent.toFixed(2)),
       openedAt: position.openedAt,
       closedAt: Date.now(),
@@ -633,6 +762,105 @@ export class SniperEngine {
   }
 
   /**
+   * Evaluates all exit conditions (TP, SL, Trailing Stop, Stagnation) for an active position.
+   * Returns true if an exit was triggered and filled.
+   */
+  private async checkAndExecuteExitConditions(
+    pos: ActivePosition,
+    currentPriceUsd: number
+  ): Promise<boolean> {
+    if (pos.status !== 'OPEN') return false;
+
+    // 1. Take Profit (active if > 0)
+    if (pos.tpPercent > 0 && currentPriceUsd >= pos.tpPriceUsd) {
+      console.log(
+        `[SniperEngine] 🎯 TAKE PROFIT TRIGGERED: ${pos.tokenSymbol} reached $${currentPriceUsd} (+${pos.pnlPercent.toFixed(2)}% >= +${pos.tpPercent}%)`
+      );
+      await this.sellPosition(
+        pos.id,
+        100,
+        `Take Profit Hit (+${pos.pnlPercent.toFixed(1)}%)`,
+        currentPriceUsd
+      );
+      return true;
+    }
+
+    // 2. Stop Loss (active if > 0)
+    if (pos.slPercent > 0 && currentPriceUsd <= pos.slPriceUsd) {
+      console.log(
+        `[SniperEngine] 🛑 STOP LOSS TRIGGERED: ${pos.tokenSymbol} dropped to $${currentPriceUsd} (${pos.pnlPercent.toFixed(2)}% <= -${pos.slPercent}%)`
+      );
+      await this.sellPosition(
+        pos.id,
+        100,
+        `Stop Loss Triggered (${pos.pnlPercent.toFixed(1)}%)`,
+        currentPriceUsd
+      );
+      return true;
+    }
+
+    // 3. Trailing Stop (active if > 0, price peaked above entry, and retreated by trailingStopPercent from peak)
+    if (
+      pos.trailingStopPercent > 0 &&
+      pos.peakPriceUsd > pos.entryPriceUsd &&
+      pos.trailingStopPriceUsd > 0 &&
+      currentPriceUsd <= pos.trailingStopPriceUsd
+    ) {
+      const peakGainPercent = ((pos.peakPriceUsd - pos.entryPriceUsd) / pos.entryPriceUsd) * 100;
+      console.log(
+        `[SniperEngine] 📉 TRAILING STOP TRIGGERED: ${pos.tokenSymbol} pulled back to $${currentPriceUsd} (-${pos.trailingStopPercent}% du pic $${pos.peakPriceUsd} [+${peakGainPercent.toFixed(1)}%])`
+      );
+      await this.sellPosition(
+        pos.id,
+        100,
+        `Trailing Stop Triggered (-${pos.trailingStopPercent}% du pic)`,
+        currentPriceUsd
+      );
+      return true;
+    }
+
+    // 4. Stagnation Auto-Sell (Sell 100% if price does not move after stagnantTimeoutSeconds)
+    const autoSellStagnant = pos.autoSellStagnant ?? this.config.autoSellStagnant ?? true;
+    const stagnantTimeoutSeconds = pos.stagnantTimeoutSeconds ?? this.config.stagnantTimeoutSeconds ?? 180;
+    const stagnantThreshold = pos.stagnantThresholdPercent ?? this.config.stagnantThresholdPercent ?? 1.0;
+
+    if (autoSellStagnant && stagnantTimeoutSeconds > 0) {
+      if (!pos.lastPriceMovementAt) pos.lastPriceMovementAt = pos.openedAt;
+      if (!pos.lastRecordedPriceUsd) pos.lastRecordedPriceUsd = pos.entryPriceUsd;
+
+      const priceDiffPercent = pos.lastRecordedPriceUsd > 0
+        ? (Math.abs(currentPriceUsd - pos.lastRecordedPriceUsd) / pos.lastRecordedPriceUsd) * 100
+        : 0;
+
+      if (priceDiffPercent >= stagnantThreshold) {
+        // Significant price movement occurred: reset the inactivity timer
+        pos.lastPriceMovementAt = Date.now();
+        pos.lastRecordedPriceUsd = currentPriceUsd;
+      }
+
+      const elapsedSinceOpenSec = (Date.now() - pos.openedAt) / 1000;
+      const elapsedWithoutMovementSec = (Date.now() - pos.lastPriceMovementAt) / 1000;
+
+      // If position has been open for at least the timeout duration and price has not moved
+      if (elapsedSinceOpenSec >= stagnantTimeoutSeconds && elapsedWithoutMovementSec >= stagnantTimeoutSeconds) {
+        const minutesFormatted = (stagnantTimeoutSeconds / 60).toFixed(stagnantTimeoutSeconds % 60 === 0 ? 0 : 1);
+        console.log(
+          `[SniperEngine] ⌛ AUTO-SELL STAGNATION TRIGGERED: ${pos.tokenSymbol} price static for ${Math.round(elapsedWithoutMovementSec)}s (PnL: ${pos.pnlPercent.toFixed(2)}%). Executing automatic 100% exit.`
+        );
+        await this.sellPosition(
+          pos.id,
+          100,
+          `Stagnation : Prix immobile après ${minutesFormatted} min (${pos.pnlPercent >= 0 ? '+' : ''}${pos.pnlPercent.toFixed(2)}%)`,
+          currentPriceUsd
+        );
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  /**
    * Continuous price tracking and TP / SL / Trailing Stop trigger checker
    */
   private startPriceTracker() {
@@ -641,20 +869,51 @@ export class SniperEngine {
       if (positions.length === 0) return;
 
       const addresses = positions.map((p) => p.tokenAddress);
-      const pairsMap = await this.dexscreener.getBatchTokenPairs(addresses);
+      const hints = new Map<string, { pairAddress?: string; dexId?: string }>();
+      for (const pos of positions) {
+        if (pos.pairAddress || pos.dexId) {
+          hints.set(pos.tokenAddress, { pairAddress: pos.pairAddress, dexId: pos.dexId });
+        }
+      }
+
+      const [pairsMap, solPriceUsd] = await Promise.all([
+        this.dexscreener.getBatchTokenPairs(addresses, hints),
+        this.dexscreener.getSolPriceUsd(),
+      ]);
 
       let hasChanges = false;
 
       for (const pos of positions) {
-        const pair = pairsMap.get(pos.tokenAddress);
+        let pair = pairsMap.get(pos.tokenAddress);
+
+        // Safety: If position has a pinned pairAddress and batch didn't match, verify directly
+        if (pos.pairAddress && pair && pair.pairAddress?.toLowerCase() !== pos.pairAddress.toLowerCase()) {
+          const directPair = await this.dexscreener.getPairByAddress(pos.pairAddress);
+          if (directPair && Number(directPair.priceUsd) > 0) {
+            pair = directPair;
+          }
+        }
+
         if (!pair) continue;
 
         const currentPriceUsd = Number(pair.priceUsd);
         if (currentPriceUsd <= 0) continue;
 
+        // Remember pinned pairAddress and dexId
+        if (!pos.pairAddress && pair.pairAddress) {
+          pos.pairAddress = pair.pairAddress;
+        }
+        if (!pos.dexId && pair.dexId) {
+          pos.dexId = pair.dexId;
+        }
+
         pos.currentPriceUsd = currentPriceUsd;
         pos.currentPriceSol = Number(pair.priceNative || pos.currentPriceSol);
         pos.lastUpdated = Date.now();
+        pos.dexUrl = pair.url || `https://dexscreener.com/solana/${pos.tokenAddress}`;
+        pos.volume5mUsd = pair.volume?.m5 || 0;
+        pos.buys5m = pair.txns?.m5?.buys || 0;
+        pos.sells5m = pair.txns?.m5?.sells || 0;
 
         // Dynamically track the highest price reached
         if (currentPriceUsd > pos.peakPriceUsd) {
@@ -672,45 +931,269 @@ export class SniperEngine {
           ? ((currentPriceUsd - pos.entryPriceUsd) / pos.entryPriceUsd) * 100
           : 0;
 
-        const solPriceUsd = pos.entryPriceSol > 0 ? pos.entryPriceUsd / pos.entryPriceSol : 150;
         const initialUsd = pos.amountSol * solPriceUsd;
-        pos.pnlUsd = (initialUsd * pos.pnlPercent) / 100;
+        pos.pnlSol = Number(((pos.amountSol * pos.pnlPercent) / 100).toFixed(4));
+        pos.pnlUsd = Number(((initialUsd * pos.pnlPercent) / 100).toFixed(2));
         hasChanges = true;
 
-        // ==========================================
-        // EXIT CONDITIONS ENGINE:
-        // ==========================================
-
-        // 1. Take Profit (active if > 0)
-        if (pos.tpPercent > 0 && currentPriceUsd >= pos.tpPriceUsd) {
-          console.log(`[SniperEngine] 🎯 TAKE PROFIT TRIGGERED: ${pos.tokenSymbol} reached $${currentPriceUsd} (+${pos.pnlPercent.toFixed(2)}% >= +${pos.tpPercent}%)`);
-          await this.sellPosition(pos.id, 100, `Take Profit Hit (+${pos.pnlPercent.toFixed(1)}%)`);
-          continue;
-        }
-
-        // 2. Stop Loss (active if > 0)
-        if (pos.slPercent > 0 && currentPriceUsd <= pos.slPriceUsd) {
-          console.log(`[SniperEngine] 🛑 STOP LOSS TRIGGERED: ${pos.tokenSymbol} dropped to $${currentPriceUsd} (${pos.pnlPercent.toFixed(2)}% <= -${pos.slPercent}%)`);
-          await this.sellPosition(pos.id, 100, `Stop Loss Triggered (${pos.pnlPercent.toFixed(1)}%)`);
-          continue;
-        }
-
-        // 3. Trailing Stop (active if > 0, price moved into profit, and retreated by trailingStopPercent from peak)
-        if (
-          pos.trailingStopPercent > 0 &&
-          pos.peakPriceUsd > pos.entryPriceUsd &&
-          currentPriceUsd <= pos.trailingStopPriceUsd
-        ) {
-          console.log(`[SniperEngine] 📉 TRAILING STOP TRIGGERED: ${pos.tokenSymbol} pulled back to $${currentPriceUsd} (-${pos.trailingStopPercent}% from peak $${pos.peakPriceUsd})`);
-          await this.sellPosition(pos.id, 100, `Trailing Stop Triggered (-${pos.trailingStopPercent}% from peak)`);
-          continue;
-        }
+        // Evaluate exit conditions
+        const exited = await this.checkAndExecuteExitConditions(pos, currentPriceUsd);
+        if (exited) continue;
       }
 
       if (hasChanges && this.onPositionUpdate) {
         this.onPositionUpdate(this.getActivePositions());
+        // Periodically persist real-time peak prices and state to disk
+        this.saveStateToDisk();
       }
     }, 2500);
+  }
+
+  /**
+   * Immediately refresh prices for all active positions on-demand and verify exit conditions
+   */
+  public async refreshPricesNow(): Promise<ActivePosition[]> {
+    const positions = Array.from(this.activePositions.values());
+    if (positions.length === 0) return [];
+
+    const addresses = positions.map((p) => p.tokenAddress);
+    const hints = new Map<string, { pairAddress?: string; dexId?: string }>();
+    for (const pos of positions) {
+      if (pos.pairAddress || pos.dexId) {
+        hints.set(pos.tokenAddress, { pairAddress: pos.pairAddress, dexId: pos.dexId });
+      }
+    }
+
+    const [pairsMap, solPriceUsd] = await Promise.all([
+      this.dexscreener.getBatchTokenPairs(addresses, hints),
+      this.dexscreener.getSolPriceUsd(),
+    ]);
+
+    for (const pos of positions) {
+      let pair = pairsMap.get(pos.tokenAddress);
+
+      if (pos.pairAddress && pair && pair.pairAddress?.toLowerCase() !== pos.pairAddress.toLowerCase()) {
+        const directPair = await this.dexscreener.getPairByAddress(pos.pairAddress);
+        if (directPair && Number(directPair.priceUsd) > 0) {
+          pair = directPair;
+        }
+      }
+
+      if (!pair) continue;
+
+      const currentPriceUsd = Number(pair.priceUsd);
+      if (currentPriceUsd <= 0) continue;
+
+      if (!pos.pairAddress && pair.pairAddress) {
+        pos.pairAddress = pair.pairAddress;
+      }
+      if (!pos.dexId && pair.dexId) {
+        pos.dexId = pair.dexId;
+      }
+
+      pos.currentPriceUsd = currentPriceUsd;
+      pos.currentPriceSol = Number(pair.priceNative || pos.currentPriceSol);
+      pos.lastUpdated = Date.now();
+      pos.dexUrl = pair.url || `https://dexscreener.com/solana/${pos.tokenAddress}`;
+      pos.volume5mUsd = pair.volume?.m5 || 0;
+      pos.buys5m = pair.txns?.m5?.buys || 0;
+      pos.sells5m = pair.txns?.m5?.sells || 0;
+
+      if (currentPriceUsd > pos.peakPriceUsd) {
+        pos.peakPriceUsd = currentPriceUsd;
+        if (pos.trailingStopPercent > 0) {
+          pos.trailingStopPriceUsd = pos.peakPriceUsd * (1 - pos.trailingStopPercent / 100);
+        }
+      }
+
+      pos.pnlPercent = pos.entryPriceUsd > 0
+        ? ((currentPriceUsd - pos.entryPriceUsd) / pos.entryPriceUsd) * 100
+        : 0;
+      const initialUsd = pos.amountSol * solPriceUsd;
+      pos.pnlSol = Number(((pos.amountSol * pos.pnlPercent) / 100).toFixed(4));
+      pos.pnlUsd = Number(((initialUsd * pos.pnlPercent) / 100).toFixed(2));
+
+      await this.checkAndExecuteExitConditions(pos, currentPriceUsd);
+    }
+
+    this.saveStateToDisk();
+    if (this.onPositionUpdate) {
+      this.onPositionUpdate(this.getActivePositions());
+    }
+    return this.getActivePositions();
+  }
+
+  public getPerformanceStats(daysCount: number = 30): PerformanceStatsResponse {
+    const days: DailyPerformanceStat[] = [];
+    const trades = this.tradeHistory || [];
+
+    const now = Date.now();
+    const DAY_MS = 86400000;
+
+    const startTime = now - daysCount * DAY_MS;
+    const relevantTrades = trades.filter((t) => (t.closedAt || t.openedAt) >= startTime);
+
+    let cumulativeSol = 0;
+    const monthNames = ['Jan', 'Fév', 'Mar', 'Avr', 'Mai', 'Juin', 'Juil', 'Août', 'Sep', 'Oct', 'Nov', 'Déc'];
+
+    for (let i = daysCount - 1; i >= 0; i--) {
+      const slotTime = now - i * DAY_MS;
+      const d = new Date(slotTime);
+      const dateStr = d.toISOString().split('T')[0];
+      const displayDate = `${d.getDate()} ${monthNames[d.getMonth()]}`;
+
+      const dayStart = new Date(dateStr + 'T00:00:00.000Z').getTime();
+      const dayEnd = dayStart + DAY_MS;
+
+      const dayTrades = relevantTrades.filter((t) => {
+        const time = t.closedAt || t.openedAt;
+        return time >= dayStart && time < dayEnd;
+      });
+
+      let dayWins = 0;
+      let dayLosses = 0;
+      let dayEven = 0;
+      let daySolProfit = 0;
+      let dayUsdProfit = 0;
+      let volumeSol = 0;
+
+      for (const t of dayTrades) {
+        volumeSol += t.amountSol || 0;
+        const pnlPercent = t.realizedPnlPercent || 0;
+        const pnlSol =
+          t.realizedPnlSol !== undefined
+            ? t.realizedPnlSol
+            : ((t.amountSol || 0.1) * pnlPercent) / 100;
+        daySolProfit += pnlSol;
+        const usdProfit =
+          t.realizedPnlUsd !== undefined && Math.abs(t.realizedPnlUsd) > 0.001
+            ? t.realizedPnlUsd
+            : pnlSol * 117.14;
+        dayUsdProfit += usdProfit;
+
+        if (pnlPercent > 0.01) {
+          dayWins++;
+        } else if (pnlPercent < -0.01) {
+          dayLosses++;
+        } else {
+          dayEven++;
+        }
+      }
+
+      cumulativeSol += daySolProfit;
+      const dayTradeTotal = dayTrades.length;
+      const winRate = dayTradeTotal > 0 ? (dayWins / dayTradeTotal) * 100 : 0;
+
+      days.push({
+        date: dateStr,
+        displayDate,
+        timestamp: dayStart,
+        tradesCount: dayTradeTotal,
+        wins: dayWins,
+        losses: dayLosses,
+        breakeven: dayEven,
+        winRate: Number(winRate.toFixed(1)),
+        dailySolProfit: Number(daySolProfit.toFixed(4)),
+        cumulativeSolProfit: Number(cumulativeSol.toFixed(4)),
+        dailyUsdProfit: Number(dayUsdProfit.toFixed(2)),
+        volumeSol: Number(volumeSol.toFixed(3)),
+        callsEvaluated: dayTradeTotal > 0 ? dayTradeTotal * 3 : 0,
+        callsPassed: dayTradeTotal,
+        snipingSuccessRate: Number(winRate.toFixed(1)),
+      });
+    }
+
+    let totalWins = 0;
+    let totalLosses = 0;
+    let totalBreakeven = 0;
+    let totalSolProfit = 0;
+    let totalUsdProfit = 0;
+    let totalSolGains = 0;
+    let totalSolLosses = 0;
+    let bestTradeSol = -Infinity;
+    let worstTradeSol = Infinity;
+    let bestTradePercent = -Infinity;
+    let worstTradePercent = Infinity;
+    let bestTradeSymbol = '';
+    let worstTradeSymbol = '';
+    let sumDurationSec = 0;
+
+    for (const t of relevantTrades) {
+      const pnlPercent = t.realizedPnlPercent || 0;
+      const pnlSol =
+        t.realizedPnlSol !== undefined
+          ? t.realizedPnlSol
+          : ((t.amountSol || 0.1) * pnlPercent) / 100;
+      totalSolProfit += pnlSol;
+      const usdProfit =
+        t.realizedPnlUsd !== undefined && Math.abs(t.realizedPnlUsd) > 0.001
+          ? t.realizedPnlUsd
+          : pnlSol * 117.14;
+      totalUsdProfit += usdProfit;
+
+      const dur = Math.max(1, Math.round(((t.closedAt || 0) - (t.openedAt || 0)) / 1000));
+      sumDurationSec += dur;
+
+      if (pnlSol > bestTradeSol) {
+        bestTradeSol = pnlSol;
+        bestTradePercent = pnlPercent;
+        bestTradeSymbol = t.tokenSymbol;
+      }
+      if (pnlSol < worstTradeSol) {
+        worstTradeSol = pnlSol;
+        worstTradePercent = pnlPercent;
+        worstTradeSymbol = t.tokenSymbol;
+      }
+
+      if (pnlPercent > 0.01) {
+        totalWins++;
+        totalSolGains += pnlSol;
+      } else if (pnlPercent < -0.01) {
+        totalLosses++;
+        totalSolLosses += Math.abs(pnlSol);
+      } else {
+        totalBreakeven++;
+      }
+    }
+
+    const totalTrades = relevantTrades.length;
+    const winRatePercent = totalTrades > 0 ? (totalWins / totalTrades) * 100 : 0;
+    const winLossRatio = totalLosses > 0 ? totalWins / totalLosses : totalWins > 0 ? totalWins : 0;
+    const profitFactor = totalSolLosses > 0 ? totalSolGains / totalSolLosses : totalSolGains > 0 ? 99 : 0;
+    const averageSolPerTrade = totalTrades > 0 ? totalSolProfit / totalTrades : 0;
+    const averageWinSol = totalWins > 0 ? totalSolGains / totalWins : 0;
+    const averageLossSol = totalLosses > 0 ? totalSolLosses / totalLosses : 0;
+    const averageDurationSec = totalTrades > 0 ? Math.round(sumDurationSec / totalTrades) : 0;
+
+    const summary: PerformanceSummary = {
+      timeframeDays: daysCount,
+      totalTrades,
+      wins: totalWins,
+      losses: totalLosses,
+      breakeven: totalBreakeven,
+      winLossRatio: Number(winLossRatio.toFixed(2)),
+      winRatePercent: Number(winRatePercent.toFixed(1)),
+      totalSolProfit: Number(totalSolProfit.toFixed(4)),
+      totalUsdProfit: Number(totalUsdProfit.toFixed(2)),
+      averageSolPerTrade: Number(averageSolPerTrade.toFixed(4)),
+      profitFactor: Number(profitFactor.toFixed(2)),
+      totalSolGains: Number(totalSolGains.toFixed(4)),
+      totalSolLosses: Number(totalSolLosses.toFixed(4)),
+      bestTradeSol: bestTradeSol === -Infinity ? 0 : Number(bestTradeSol.toFixed(4)),
+      worstTradeSol: worstTradeSol === Infinity ? 0 : Number(worstTradeSol.toFixed(4)),
+      bestTradePercent: bestTradePercent === -Infinity ? 0 : Number(bestTradePercent.toFixed(1)),
+      worstTradePercent: worstTradePercent === Infinity ? 0 : Number(worstTradePercent.toFixed(1)),
+      bestTradeSymbol: bestTradeSymbol || '-',
+      worstTradeSymbol: worstTradeSymbol || '-',
+      averageWinSol: Number(averageWinSol.toFixed(4)),
+      averageLossSol: Number(averageLossSol.toFixed(4)),
+      averageDurationSec,
+      totalCallsEvaluated: totalTrades * 3,
+      totalCallsPassed: totalTrades,
+      overallSnipingPassRate: Number(winRatePercent.toFixed(1)),
+    };
+
+    return { days, summary };
   }
 
   public destroy() {

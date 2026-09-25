@@ -47,22 +47,57 @@ export const TradeHistory: React.FC<TradeHistoryProps> = ({ history }) => {
                     </span>
                   </div>
                   <div className="text-[11px] text-zinc-400 mt-1">
-                    Exit: <span className="text-zinc-300">{trade.exitReason}</span> ({durationSec}s)
+                    Exit:{' '}
+                    <span
+                      className={`font-semibold ${
+                        trade.exitReason?.includes('Stagnation')
+                          ? 'text-amber-300'
+                          : trade.exitReason?.includes('Take Profit')
+                          ? 'text-emerald-400'
+                          : trade.exitReason?.includes('Stop Loss')
+                          ? 'text-rose-400'
+                          : 'text-zinc-300'
+                      }`}
+                    >
+                      {trade.exitReason}
+                    </span>{' '}
+                    ({durationSec}s)
                   </div>
                 </div>
 
                 <div className="text-right">
                   <div
-                    className={`font-bold ${
-                      isProfit ? 'text-white' : 'text-zinc-400'
+                    className={`font-bold text-sm ${
+                      trade.realizedPnlPercent > 0.01
+                        ? 'text-emerald-400'
+                        : trade.realizedPnlPercent < -0.01
+                        ? 'text-rose-400'
+                        : 'text-zinc-400'
                     }`}
                   >
-                    {isProfit ? '+' : ''}
+                    {trade.realizedPnlPercent > 0 ? '+' : ''}
                     {trade.realizedPnlPercent.toFixed(2)}%
                   </div>
-                  <div className="text-[11px] text-zinc-500">
-                    {isProfit ? '+' : ''}${trade.realizedPnlUsd.toFixed(2)} USD
-                  </div>
+                  {(() => {
+                    const solPnl =
+                      trade.realizedPnlSol !== undefined
+                        ? trade.realizedPnlSol
+                        : ((trade.amountSol || 0.1) * trade.realizedPnlPercent) / 100;
+                    const usdPnl =
+                      trade.realizedPnlUsd !== undefined && Math.abs(trade.realizedPnlUsd) > 0.001
+                        ? trade.realizedPnlUsd
+                        : solPnl * 117.14;
+                    return (
+                      <div className="text-[11px] font-mono text-zinc-400">
+                        <span className={usdPnl >= 0 ? 'text-emerald-400/90' : 'text-rose-400/90'}>
+                          {usdPnl >= 0 ? '+' : ''}${usdPnl.toFixed(2)}
+                        </span>
+                        <span className="text-zinc-500 text-[10px] ml-1">
+                          ({solPnl >= 0 ? '+' : ''}{solPnl.toFixed(4)} SOL)
+                        </span>
+                      </div>
+                    );
+                  })()}
                 </div>
               </div>
             );

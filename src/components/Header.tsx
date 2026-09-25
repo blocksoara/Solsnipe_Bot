@@ -1,6 +1,6 @@
 import React from 'react';
-import { Wallet, Smartphone, ShieldCheck } from 'lucide-react';
-import { SniperConfig, TelegramStatus } from '../types';
+import { Wallet, Smartphone, ShieldCheck, Lock } from 'lucide-react';
+import { SecurityStatus, SniperConfig, TelegramStatus } from '../types';
 
 interface HeaderProps {
   status: TelegramStatus | null;
@@ -10,6 +10,9 @@ interface HeaderProps {
   totalCallsCount: number;
   totalPnlUsd: number;
   onOpenSettings?: () => void;
+  securityStatus?: SecurityStatus | null;
+  onLockDashboard?: () => void;
+  onOpenSecurityModal?: () => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -20,6 +23,9 @@ export const Header: React.FC<HeaderProps> = ({
   totalCallsCount,
   totalPnlUsd,
   onOpenSettings,
+  securityStatus,
+  onLockDashboard,
+  onOpenSecurityModal,
 }) => {
   return (
     <header className="border-b border-zinc-800 bg-black sticky top-0 z-30">
@@ -172,6 +178,29 @@ export const Header: React.FC<HeaderProps> = ({
           >
             {config.autoSnipe ? '● AUTO ON' : '○ AUTO OFF'}
           </button>
+
+          {/* Lock / Security Button */}
+          {securityStatus?.enabled ? (
+            <button
+              type="button"
+              onClick={onLockDashboard}
+              title="Verrouiller le dashboard maintenant"
+              className="flex items-center gap-1.5 px-2.5 py-1 rounded bg-zinc-950 hover:bg-zinc-900 border border-zinc-800 text-xs font-mono text-zinc-300 hover:text-white transition-colors cursor-pointer"
+            >
+              <Lock className="w-3.5 h-3.5 text-emerald-400" />
+              <span className="hidden sm:inline text-[11px] font-bold">Verrouiller</span>
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={onOpenSecurityModal}
+              title="Configurer un code d'accès au dashboard"
+              className="flex items-center gap-1.5 px-2.5 py-1 rounded bg-zinc-950 hover:bg-zinc-900 border border-zinc-800 text-xs font-mono text-amber-400/90 hover:text-amber-300 transition-colors cursor-pointer"
+            >
+              <ShieldCheck className="w-3.5 h-3.5 text-amber-400" />
+              <span className="hidden sm:inline text-[11px] font-bold">Code Dashboard</span>
+            </button>
+          )}
         </div>
       </div>
     </header>

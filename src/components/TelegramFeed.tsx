@@ -2,7 +2,8 @@ import React, { useState } from 'react';
 import { TelegramCall, TelegramStatus } from '../types';
 import { ConditionBadge } from './ConditionBadge';
 import { TelegramChannelManager } from './TelegramChannelManager';
-import { Radio, Plus, Settings2 } from 'lucide-react';
+import { RugCheckBadge } from './RugCheckBadge';
+import { Radio, Plus, Settings2, ShieldCheck, ShieldAlert, AlertTriangle } from 'lucide-react';
 
 interface TelegramFeedProps {
   calls: TelegramCall[];
@@ -10,6 +11,7 @@ interface TelegramFeedProps {
   onChannelsUpdated?: (updatedStatus: TelegramStatus) => void;
   onSelectCall: (call: TelegramCall) => void;
   onManualSnipe: (tokenAddress: string) => void;
+  onReanalyzeCall?: (call: TelegramCall) => void;
 }
 
 export const TelegramFeed: React.FC<TelegramFeedProps> = ({
@@ -18,9 +20,11 @@ export const TelegramFeed: React.FC<TelegramFeedProps> = ({
   onChannelsUpdated,
   onSelectCall,
   onManualSnipe,
+  onReanalyzeCall,
 }) => {
   const [copiedAddress, setCopiedAddress] = useState<string | null>(null);
   const [channelFilter, setChannelFilter] = useState<string>('ALL');
+  const [rugFilter, setRugFilter] = useState<'ALL' | 'SAFE' | 'WARN' | 'DANGER'>('ALL');
   const [showChannelManager, setShowChannelManager] = useState<boolean>(false);
 
   // Extract all unique channels from configured channels and received calls
@@ -59,13 +63,43 @@ export const TelegramFeed: React.FC<TelegramFeedProps> = ({
       if (!c || !c.id) return false;
       if (seen.has(c.id)) return false;
       seen.add(c.id);
-      if (channelFilter === 'ALL') return true;
-      const lowerFilter = channelFilter.toLowerCase();
-      const inPrimary = c.channel.toLowerCase().includes(lowerFilter);
-      const inChannels = c.channels && c.channels.some((ch) => ch.toLowerCase().includes(lowerFilter));
-      return inPrimary || inChannels;
+
+      // Channel Filter
+      if (channelFilter !== 'ALL') {
+        const lowerFilter = channelFilter.toLowerCase();
+        const inPrimary = c.channel.toLowerCase().includes(lowerFilter);
+        const inChannels = c.channels && c.channels.some((ch) => ch.toLowerCase().includes(lowerFilter));
+        if (!inPrimary && !inChannels) return false;
+      }
+
+      // RugCheck Security Filter
+      if (rugFilter !== 'ALL') {
+        const rc = c.rugCheck || c.analysis?.rugCheck;
+        if (!rc) return false;
+        if (rugFilter === 'SAFE' && (rc.status !== 'good' || rc.score >= 500)) return false;
+        if (rugFilter === 'WARN' && rc.status !== 'warn') return false;
+        if (rugFilter === 'DANGER' && rc.status !== 'danger' && rc.score < 1000 && !rc.rugged) return false;
+      }
+
+      return true;
     });
-  }, [calls, channelFilter]);
+  }, [calls, channelFilter, rugFilter]);
+
+  // Count calls by RugCheck status for badge metrics
+  const rugStats = React.useMemo(() => {
+    let safe = 0;
+    let warn = 0;
+    let danger = 0;
+    calls.forEach((c) => {
+      const rc = c.rugCheck || c.analysis?.rugCheck;
+      if (rc) {
+        if (rc.rugged || rc.status === 'danger' || rc.score >= 1000) danger++;
+        else if (rc.status === 'warn' || rc.score >= 500) warn++;
+        else safe++;
+      }
+    });
+    return { safe, warn, danger };
+  }, [calls]);
 
   return (
     <div className="space-y-4">
@@ -120,6 +154,74 @@ export const TelegramFeed: React.FC<TelegramFeedProps> = ({
             <Settings2 className="w-3.5 h-3.5" />
             <span>{showChannelManager ? 'Masquer Gestionnaire' : `+ / - Canaux (${status?.channels?.length ?? availableChannels.length})`}</span>
           </button>
+        </div>
+      </div>
+
+      {/* RugCheck Security Score Quick Filters Bar */}
+      <div className="flex items-center justify-between gap-2 p-2 rounded bg-zinc-950/80 border border-zinc-900 text-xs font-mono flex-wrap">
+        <div className="flex items-center gap-1.5 flex-wrap">
+          <span className="text-[11px] font-semibold text-zinc-400 flex items-center gap-1 mr-1">
+            <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
+            <span>Filtre RugCheck :</span>
+          </span>
+
+          <button
+            type="button"
+            onClick={() => setRugFilter('ALL')}
+            className={`px-2 py-0.5 rounded text-[11px] font-semibold transition-colors cursor-pointer ${
+              rugFilter === 'ALL'
+                ? 'bg-white text-black'
+                : 'bg-zinc-900 text-zinc-400 hover:text-white border border-zinc-800'
+            }`}
+          >
+            Tous ({calls.length})
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setRugFilter('SAFE')}
+            className={`px-2 py-0.5 rounded text-[11px] font-semibold transition-colors flex items-center gap-1 cursor-pointer ${
+              rugFilter === 'SAFE'
+                ? 'bg-emerald-500 text-black font-bold'
+                : 'bg-emerald-950/40 text-emerald-400 hover:bg-emerald-950/70 border border-emerald-900/60'
+            }`}
+            title="Afficher uniquement les tokens avec score sain (< 500)"
+          >
+            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+            <span>Sécurisé / Bon ({rugStats.safe})</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setRugFilter('WARN')}
+            className={`px-2 py-0.5 rounded text-[11px] font-semibold transition-colors flex items-center gap-1 cursor-pointer ${
+              rugFilter === 'WARN'
+                ? 'bg-amber-500 text-black font-bold'
+                : 'bg-amber-950/40 text-amber-300 hover:bg-amber-950/70 border border-amber-900/60'
+            }`}
+            title="Tokens avec avertissement ou score modéré (500 - 1000)"
+          >
+            <span className="w-1.5 h-1.5 rounded-full bg-amber-400" />
+            <span>Attention ({rugStats.warn})</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setRugFilter('DANGER')}
+            className={`px-2 py-0.5 rounded text-[11px] font-semibold transition-colors flex items-center gap-1 cursor-pointer ${
+              rugFilter === 'DANGER'
+                ? 'bg-rose-500 text-white font-bold'
+                : 'bg-rose-950/40 text-rose-300 hover:bg-rose-950/70 border border-rose-900/60'
+            }`}
+            title="Tokens à haut risque ou avec flag danger (1000+ ou risques critiques)"
+          >
+            <span className="w-1.5 h-1.5 rounded-full bg-rose-500" />
+            <span>Danger / Élevé ({rugStats.danger})</span>
+          </button>
+        </div>
+
+        <div className="text-[10px] text-zinc-500">
+          Analyse RugCheck.xyz on-chain temps réel
         </div>
       </div>
 
@@ -231,6 +333,52 @@ export const TelegramFeed: React.FC<TelegramFeedProps> = ({
                   </div>
                 </div>
 
+                {/* RugCheck Score Indicator & Security Analysis Layer */}
+                <div className="flex items-center justify-between gap-2 mb-2 pb-2 border-b border-zinc-900/80 flex-wrap">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <RugCheckBadge
+                      tokenAddress={call.tokenAddress}
+                      rugCheck={call.rugCheck || call.analysis?.rugCheck}
+                    />
+
+                    {/* Launchpad Pill if available */}
+                    {call.analysis?.rawMetrics?.launchpad && (
+                      <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-zinc-900 text-zinc-400 border border-zinc-800">
+                        {String(call.analysis.rawMetrics.launchpad)}
+                      </span>
+                    )}
+
+                    {/* Quick Risk Pill Summary */}
+                    {(call.rugCheck || call.analysis?.rugCheck)?.risksCount !== undefined && (
+                      <span className="text-[10px] font-mono text-zinc-500">
+                        {(call.rugCheck || call.analysis?.rugCheck)?.risksCount === 0
+                          ? '0 risque détecté'
+                          : `${(call.rugCheck || call.analysis?.rugCheck)?.risksCount} risque(s)`}
+                      </span>
+                    )}
+                  </div>
+
+                  {/* Right side audit status tag */}
+                  <div className="text-[11px] font-mono">
+                    {(call.rugCheck || call.analysis?.rugCheck)?.status === 'good' ? (
+                      <span className="text-emerald-400 text-[10px] font-semibold flex items-center gap-1">
+                        <ShieldCheck className="w-3 h-3" />
+                        <span>Sécurisé (&lt;500)</span>
+                      </span>
+                    ) : (call.rugCheck || call.analysis?.rugCheck)?.status === 'danger' ? (
+                      <span className="text-rose-400 text-[10px] font-semibold flex items-center gap-1">
+                        <ShieldAlert className="w-3 h-3" />
+                        <span>Risque Critique</span>
+                      </span>
+                    ) : (call.rugCheck || call.analysis?.rugCheck)?.status === 'warn' ? (
+                      <span className="text-amber-300 text-[10px] font-semibold flex items-center gap-1">
+                        <AlertTriangle className="w-3 h-3" />
+                        <span>Risque Modéré</span>
+                      </span>
+                    ) : null}
+                  </div>
+                </div>
+
                 {/* Contract Address row */}
                 <div className="flex items-center gap-2 py-1.5 px-2 bg-zinc-950/70 border border-zinc-900 rounded text-xs font-mono mb-2.5">
                   <span className="text-zinc-500 text-[11px]">CA:</span>
@@ -280,12 +428,19 @@ export const TelegramFeed: React.FC<TelegramFeedProps> = ({
                   </div>
 
                   <div className="flex items-center gap-2">
+                    <button
+                      onClick={() => (onReanalyzeCall ? onReanalyzeCall(call) : onSelectCall(call))}
+                      className="px-2.5 py-1 text-[11px] font-mono rounded bg-zinc-900 text-zinc-300 hover:text-white hover:bg-zinc-800 border border-zinc-800"
+                      title={hasAnalysis ? "Relancer l'audit multi-sources" : "Lancer l'audit"}
+                    >
+                      {hasAnalysis ? 'RE-AUDIT' : 'AUDIT'}
+                    </button>
                     {hasAnalysis && (
                       <button
                         onClick={() => onSelectCall(call)}
                         className="px-2.5 py-1 text-[11px] font-mono rounded bg-zinc-900 text-zinc-300 hover:text-white hover:bg-zinc-800 border border-zinc-800"
                       >
-                        FULL AUDIT
+                        DÉTAILS
                       </button>
                     )}
                     {!isSniped && (

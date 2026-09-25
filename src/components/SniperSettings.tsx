@@ -19,30 +19,39 @@ import {
   Radio,
   Trash2,
   Plus,
+  Clock,
+  AlertTriangle,
+  Target,
 } from 'lucide-react';
-import { SniperConfig, TelegramStatus } from '../types';
+import { SecurityStatus, SniperConfig, TelegramStatus } from '../types';
 import { TelegramChannelManager } from './TelegramChannelManager';
 
 interface SniperSettingsProps {
   config: SniperConfig;
   status: TelegramStatus | null;
+  securityStatus?: SecurityStatus | null;
   onUpdateConfig: (newConfig: Partial<SniperConfig>) => void;
   onRequestTelegramCode: (phone?: string) => Promise<{ success: boolean; message: string; requiresPassword?: boolean }>;
   onVerifyTelegramCode: (code: string, password?: string) => Promise<{ success: boolean; message: string; requiresPassword?: boolean }>;
   onImportPrivateKey: (pk: string) => Promise<{ success: boolean; message: string; publicKey?: string; balanceSol?: number }>;
   onRefreshWalletBalance?: () => Promise<void>;
   onDisconnectTelegram?: () => Promise<{ success: boolean; message: string }>;
+  onOpenSecurityModal?: () => void;
+  onLockDashboard?: () => void;
 }
 
 export const SniperSettings: React.FC<SniperSettingsProps> = ({
   config,
   status,
+  securityStatus,
   onUpdateConfig,
   onRequestTelegramCode,
   onVerifyTelegramCode,
   onImportPrivateKey,
   onRefreshWalletBalance,
   onDisconnectTelegram,
+  onOpenSecurityModal,
+  onLockDashboard,
 }) => {
   // Strategy settings
   const [amount, setAmount] = useState(config.tradingAmountSol.toString());
@@ -50,10 +59,18 @@ export const SniperSettings: React.FC<SniperSettingsProps> = ({
   const [sl, setSl] = useState(config.stopLossPercent.toString());
   const [trailing, setTrailing] = useState(config.trailingStopPercent.toString());
   const [slippage, setSlippage] = useState(config.slippagePercent.toString());
+  const [autoSellStagnant, setAutoSellStagnant] = useState(config.autoSellStagnant !== false);
+  const [stagnantTimeoutSeconds, setStagnantTimeoutSeconds] = useState((config.stagnantTimeoutSeconds || 180).toString());
+  const [stagnantThresholdPercent, setStagnantThresholdPercent] = useState((config.stagnantThresholdPercent || 1.0).toString());
   const [priorityFee, setPriorityFee] = useState((config.priorityFeeSol || 0.005).toString());
   const [jitoTip, setJitoTip] = useState((config.jitoTipSol || 0.005).toString());
   const [router, setRouter] = useState(config.router);
   const [mode, setMode] = useState(config.executionMode);
+  const [maxRugCheckScore, setMaxRugCheckScore] = useState((config.maxRugCheckScore ?? 800).toString());
+  const [rejectOnRugCheckDanger, setRejectOnRugCheckDanger] = useState(config.rejectOnRugCheckDanger !== false);
+  const [maxEntryMarketCapUsd, setMaxEntryMarketCapUsd] = useState((config.maxEntryMarketCapUsd ?? 40000).toString());
+  const [maxTokenAgeMinutes, setMaxTokenAgeMinutes] = useState((config.maxTokenAgeMinutes ?? 15).toString());
+  const [requirePositiveMomentum5m, setRequirePositiveMomentum5m] = useState(config.requirePositiveMomentum5m !== false);
   const [saveSuccessMsg, setSaveSuccessMsg] = useState<string | null>(null);
 
   // Wallet Management
@@ -87,10 +104,18 @@ export const SniperSettings: React.FC<SniperSettingsProps> = ({
     setSl(config.stopLossPercent.toString());
     setTrailing(config.trailingStopPercent.toString());
     setSlippage(config.slippagePercent.toString());
+    setAutoSellStagnant(config.autoSellStagnant !== false);
+    setStagnantTimeoutSeconds((config.stagnantTimeoutSeconds || 180).toString());
+    setStagnantThresholdPercent((config.stagnantThresholdPercent || 1.0).toString());
     setPriorityFee((config.priorityFeeSol || 0.005).toString());
     setJitoTip((config.jitoTipSol || 0.005).toString());
     setRouter(config.router);
     setMode(config.executionMode);
+    setMaxRugCheckScore((config.maxRugCheckScore ?? 800).toString());
+    setRejectOnRugCheckDanger(config.rejectOnRugCheckDanger !== false);
+    setMaxEntryMarketCapUsd((config.maxEntryMarketCapUsd ?? 40000).toString());
+    setMaxTokenAgeMinutes((config.maxTokenAgeMinutes ?? 15).toString());
+    setRequirePositiveMomentum5m(config.requirePositiveMomentum5m !== false);
   }, [config]);
 
   // Sync phone input when status updates
@@ -119,13 +144,26 @@ export const SniperSettings: React.FC<SniperSettingsProps> = ({
     const finalSlippage = parseNumber(slippage, 5, false);
     const finalPriorityFee = parseNumber(priorityFee, 0.005, false);
     const finalJitoTip = parseNumber(jitoTip, 0.005, false);
+    const finalStagnantTimeout = parseNumber(stagnantTimeoutSeconds, 180, false);
+    const finalStagnantThreshold = parseNumber(stagnantThresholdPercent, 1.0, false);
+    const finalMaxRugCheckScore = parseNumber(maxRugCheckScore, 800, true);
+    const finalMaxEntryMc = parseNumber(maxEntryMarketCapUsd, 40000, true);
+    const finalMaxTokenAge = parseNumber(maxTokenAgeMinutes, 15, true);
 
     onUpdateConfig({
       tradingAmountSol: finalAmount,
       takeProfitPercent: finalTp,
       stopLossPercent: finalSl,
       trailingStopPercent: finalTrailing,
+      autoSellStagnant,
+      stagnantTimeoutSeconds: finalStagnantTimeout,
+      stagnantThresholdPercent: finalStagnantThreshold,
       slippagePercent: finalSlippage,
+      maxRugCheckScore: finalMaxRugCheckScore,
+      rejectOnRugCheckDanger,
+      maxEntryMarketCapUsd: finalMaxEntryMc,
+      maxTokenAgeMinutes: finalMaxTokenAge,
+      requirePositiveMomentum5m,
       priorityFeeSol: finalPriorityFee,
       jitoTipSol: finalJitoTip,
       router,
@@ -133,7 +171,7 @@ export const SniperSettings: React.FC<SniperSettingsProps> = ({
     });
 
     setSaveSuccessMsg(
-      `✓ Configuration enregistrée et sauvegardée (Mode: ${mode === 'wallet' ? 'RÉEL' : 'SIMULATION'}, Achat: ${finalAmount} SOL, TP: ${finalTp > 0 ? `+${finalTp}%` : 'Off'}, SL: ${finalSl > 0 ? `-${finalSl}%` : 'Off'}, Trailing: ${finalTrailing > 0 ? `-${finalTrailing}%` : 'Off'})`
+      `✓ Configuration enregistrée (Mode: ${mode === 'wallet' ? 'RÉEL' : 'SIMULATION'}, TP: ${finalTp > 0 ? `+${finalTp}%` : 'Off'}, SL: ${finalSl > 0 ? `-${finalSl}%` : 'Off'}, MC Max: ${finalMaxEntryMc ? `$${finalMaxEntryMc.toLocaleString()}` : 'Illimité'}, Âge Max: ${finalMaxTokenAge ? `${finalMaxTokenAge}m` : 'Illimité'})`
     );
     setTimeout(() => setSaveSuccessMsg(null), 5000);
   };
@@ -391,6 +429,85 @@ export const SniperSettings: React.FC<SniperSettingsProps> = ({
 
   return (
     <div className="space-y-6">
+      {/* SECTION 0: CODE D'ACCÈS & SÉCURITÉ DU STREAMING DASHBOARD */}
+      <div className="p-4 sm:p-5 rounded-lg border border-zinc-800 bg-zinc-950 text-xs font-mono space-y-4">
+        <div className="flex items-center justify-between flex-wrap gap-2 pb-3 border-b border-zinc-900">
+          <div className="flex items-center gap-2.5">
+            <div className="p-2 rounded bg-zinc-900 text-emerald-400 border border-zinc-800">
+              <ShieldCheck className="w-4 h-4" />
+            </div>
+            <div>
+              <h2 className="text-sm font-bold text-white uppercase tracking-wider flex items-center gap-2">
+                Code d'Accès & Sécurité du Dashboard
+              </h2>
+              <p className="text-[11px] text-zinc-400 mt-0.5">
+                Restreindre l'accès au terminal de streaming et aux configurations par code secret
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <span
+              className={`px-2.5 py-1 rounded text-[11px] font-bold uppercase tracking-wider border ${
+                securityStatus?.enabled
+                  ? 'bg-emerald-950/80 border-emerald-500/50 text-emerald-300'
+                  : 'bg-zinc-900 border-zinc-800 text-zinc-400'
+              }`}
+            >
+              {securityStatus?.enabled ? '● Protection Activée' : '○ Protection Inactive'}
+            </span>
+          </div>
+        </div>
+
+        <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 p-3.5 rounded-lg bg-zinc-900/60 border border-zinc-850">
+          <div className="space-y-1">
+            <div className="flex items-center gap-2 text-white font-semibold">
+              <Key className="w-4 h-4 text-emerald-400" />
+              <span>
+                {securityStatus?.hasCodeSet
+                  ? 'Code de connexion configuré (Chiffrement SHA-256)'
+                  : 'Aucun code configuré pour ce terminal'}
+              </span>
+            </div>
+            <p className="text-[11px] text-zinc-400">
+              {securityStatus?.hasCodeSet
+                ? `Verrouillage automatique : ${
+                    securityStatus.autoLockMinutes === 0
+                      ? 'À la fermeture du navigateur / de l\'onglet'
+                      : securityStatus.autoLockMinutes === -1
+                      ? 'Manuel uniquement'
+                      : `Après ${securityStatus.autoLockMinutes} min d'inactivité`
+                  }`
+                : 'Configurez un code PIN ou mot de passe pour empêcher tout accès non autorisé à vos alertes et clés.'}
+            </p>
+          </div>
+
+          <div className="flex items-center gap-2 w-full sm:w-auto">
+            {onOpenSecurityModal && (
+              <button
+                type="button"
+                onClick={onOpenSecurityModal}
+                className="flex-1 sm:flex-none px-3.5 py-2 rounded-lg bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 hover:border-zinc-600 text-white font-mono text-xs font-semibold transition-colors cursor-pointer flex items-center justify-center gap-1.5"
+              >
+                <Key className="w-3.5 h-3.5 text-emerald-400" />
+                {securityStatus?.hasCodeSet ? 'Modifier le code' : 'Configurer le code'}
+              </button>
+            )}
+
+            {securityStatus?.enabled && onLockDashboard && (
+              <button
+                type="button"
+                onClick={onLockDashboard}
+                className="flex-1 sm:flex-none px-3.5 py-2 rounded-lg bg-zinc-850 hover:bg-zinc-800 border border-zinc-700 text-zinc-300 hover:text-white font-mono text-xs font-semibold transition-colors cursor-pointer flex items-center justify-center gap-1.5"
+              >
+                <Lock className="w-3.5 h-3.5 text-emerald-400" />
+                Verrouiller
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+
       {/* SECTION 1: PORTEFEUILLE SOLANA (IMPORT CLÉ & MODE RÉEL) */}
       <div className="p-4 sm:p-5 rounded-lg border border-zinc-800 bg-zinc-950 text-xs font-mono space-y-4">
         <div className="flex items-center justify-between flex-wrap gap-2 pb-3 border-b border-zinc-900">
@@ -986,6 +1103,361 @@ export const SniperSettings: React.FC<SniperSettingsProps> = ({
                 onChange={(e) => setTrailing(e.target.value)}
                 className="w-full bg-zinc-950 border border-zinc-800 rounded px-3 py-2 text-white font-bold text-sm focus:outline-none focus:border-amber-500"
               />
+            </div>
+          </div>
+
+          {/* Dynamic Risk / Reward Analysis & Guidance */}
+          {(() => {
+            const tpVal = parseFloat(tp) || 0;
+            const slVal = parseFloat(sl) || 0;
+            const trailingVal = parseFloat(trailing) || 0;
+            if (tpVal <= 0 && trailingVal <= 0) return null;
+
+            if (slVal > 0 && tpVal > 0 && tpVal < slVal) {
+              const ratio = (slVal / tpVal).toFixed(1);
+              return (
+                <div className="p-3 rounded-lg border border-amber-500/40 bg-amber-950/20 text-amber-200 text-xs flex items-start gap-2.5">
+                  <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                  <div className="space-y-1">
+                    <div className="font-bold flex items-center gap-1.5 text-amber-300">
+                      <span>Ratio Risque / Rendement Défavorable (1 : {ratio})</span>
+                    </div>
+                    <p className="text-[11px] text-zinc-300 leading-relaxed">
+                      Avec un Take Profit de <strong className="text-emerald-400">+{tpVal}%</strong> et un Stop Loss de <strong className="text-red-400">-{slVal}%</strong>, il vous faut {ratio} trades gagnants pour compenser 1 seule perte. Sur les memecoins Solana, les pumps sains dépassent souvent <strong>+30% à +100%</strong>. Pour maximiser vos gains nets, augmentez votre Take Profit (ex: +25% à +50%) ou activez un Trailing Stop (+10%).
+                    </p>
+                  </div>
+                </div>
+              );
+            }
+
+            if (slVal > 0 && tpVal >= slVal * 1.5) {
+              const ratio = (tpVal / slVal).toFixed(1);
+              return (
+                <div className="p-2.5 rounded-lg border border-emerald-500/30 bg-emerald-950/20 text-emerald-300 text-xs flex items-center gap-2">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                  <span className="text-[11px]">
+                    Ratio Risque/Rendement favorable (<strong>{ratio} : 1</strong>) : un gain de +{tpVal}% compense {ratio} pertes à -{slVal}%.
+                  </span>
+                </div>
+              );
+            }
+            return null;
+          })()}
+
+          {/* Stagnation Auto-Sell (Inactivité / Cours Immobile) */}
+          <div className="p-3.5 rounded border border-amber-900/40 bg-amber-950/10 space-y-3">
+            <div className="flex items-center justify-between flex-wrap gap-2">
+              <div className="flex items-center gap-2">
+                <Clock className="w-4 h-4 text-amber-400 shrink-0" />
+                <div>
+                  <div className="font-bold text-white text-xs flex items-center gap-2">
+                    <span>AUTO-SELL SI COURS IMMOBILE (STAGNATION)</span>
+                    <span className="px-1.5 py-0.5 rounded text-[9px] font-mono font-bold uppercase bg-amber-900/50 text-amber-300 border border-amber-700/50">
+                      3 min par défaut
+                    </span>
+                  </div>
+                  <div className="text-[11px] text-zinc-400 mt-0.5">
+                    Vend automatiquement 100% de la position si le prix ne bouge pas après un délai imparti
+                  </div>
+                </div>
+              </div>
+
+              {/* Toggle Switch */}
+              <button
+                type="button"
+                onClick={() => setAutoSellStagnant(!autoSellStagnant)}
+                className={`relative inline-flex h-5 w-10 items-center rounded-full transition-colors cursor-pointer ${
+                  autoSellStagnant ? 'bg-amber-500' : 'bg-zinc-800'
+                }`}
+              >
+                <span
+                  className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
+                    autoSellStagnant ? 'translate-x-5' : 'translate-x-1'
+                  }`}
+                />
+              </button>
+            </div>
+
+            {autoSellStagnant && (
+              <div className="pt-2 border-t border-zinc-850 space-y-2.5">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  {/* Timeout duration */}
+                  <div>
+                    <div className="flex items-center justify-between mb-1.5 text-[11px]">
+                      <span className="text-zinc-300 font-semibold">DÉLAI SANS MOUVEMENT</span>
+                      <span className="text-amber-400 font-bold">
+                        {Math.round(parseInt(stagnantTimeoutSeconds || '180', 10) / 60)} min ({stagnantTimeoutSeconds}s)
+                      </span>
+                    </div>
+                    <div className="grid grid-cols-4 gap-1 mb-1.5">
+                      {[
+                        { label: '1 min', sec: 60 },
+                        { label: '2 min', sec: 120 },
+                        { label: '3 min', sec: 180 },
+                        { label: '5 min', sec: 300 },
+                      ].map((item) => (
+                        <button
+                          key={item.sec}
+                          type="button"
+                          onClick={() => setStagnantTimeoutSeconds(item.sec.toString())}
+                          className={`py-1 text-[11px] rounded border transition-colors cursor-pointer ${
+                            stagnantTimeoutSeconds === item.sec.toString()
+                              ? 'bg-amber-500 text-black border-amber-400 font-bold'
+                              : 'bg-zinc-950 text-zinc-400 border-zinc-800 hover:text-white'
+                          }`}
+                        >
+                          {item.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Threshold Percent */}
+                  <div>
+                    <div className="flex items-center justify-between mb-1.5 text-[11px]">
+                      <span className="text-zinc-300 font-semibold">SEUIL DE VARIATION MINIMALE</span>
+                      <span className="text-amber-300 font-bold">±{stagnantThresholdPercent}%</span>
+                    </div>
+                    <input
+                      type="number"
+                      step="0.1"
+                      min="0.1"
+                      max="10"
+                      value={stagnantThresholdPercent}
+                      onChange={(e) => setStagnantThresholdPercent(e.target.value)}
+                      className="w-full bg-zinc-950 border border-zinc-800 rounded px-3 py-1.5 text-white font-bold text-xs focus:outline-none focus:border-amber-500"
+                    />
+                    <div className="text-[10px] text-zinc-500 mt-1">
+                      Si la fluctuation reste inférieure à ±{stagnantThresholdPercent}% après le délai, la position est vendue à 100%.
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* RugCheck On-Chain Security Layer */}
+          <div className="p-3.5 rounded border border-emerald-900/40 bg-emerald-950/10 space-y-3">
+            <div className="flex items-center justify-between flex-wrap gap-2">
+              <div className="flex items-center gap-2">
+                <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
+                <div>
+                  <div className="font-bold text-white text-xs flex items-center gap-2">
+                    <span>SÉCURITÉ RUGCHECK & COUCHE ANTI-RUG</span>
+                    <span className="px-1.5 py-0.5 rounded text-[9px] font-mono font-bold uppercase bg-emerald-900/50 text-emerald-300 border border-emerald-700/50">
+                      Audit On-Chain
+                    </span>
+                  </div>
+                  <div className="text-[11px] text-zinc-400 mt-0.5">
+                    Couche de défense supplémentaire : bloque le sniping auto si le score RugCheck dépasse le seuil ou présente un risque critique
+                  </div>
+                </div>
+              </div>
+
+              {/* Reject on Danger Toggle */}
+              <div className="flex items-center gap-2">
+                <span className="text-[10px] text-zinc-400 font-mono">Bloquer Danger :</span>
+                <button
+                  type="button"
+                  onClick={() => setRejectOnRugCheckDanger(!rejectOnRugCheckDanger)}
+                  className={`relative inline-flex h-5 w-10 items-center rounded-full transition-colors cursor-pointer ${
+                    rejectOnRugCheckDanger ? 'bg-emerald-500' : 'bg-zinc-800'
+                  }`}
+                  title="Bloquer immédiatement tout token ayant un flag DANGER ou RUGGED"
+                >
+                  <span
+                    className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
+                      rejectOnRugCheckDanger ? 'translate-x-5' : 'translate-x-1'
+                    }`}
+                  />
+                </button>
+              </div>
+            </div>
+
+            <div className="pt-2 border-t border-zinc-850 space-y-2.5">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                {/* Max Score Input */}
+                <div>
+                  <div className="flex items-center justify-between mb-1.5 text-[11px]">
+                    <span className="text-zinc-300 font-semibold">SCORE RUGCHECK MAXIMAL TOLÉRÉ</span>
+                    <span className="text-emerald-400 font-bold">
+                      {parseInt(maxRugCheckScore, 10) === 0 ? 'Désactivé' : `< ${maxRugCheckScore} pts`}
+                    </span>
+                  </div>
+                  <input
+                    type="number"
+                    step="50"
+                    min="0"
+                    max="10000"
+                    value={maxRugCheckScore}
+                    onChange={(e) => setMaxRugCheckScore(e.target.value)}
+                    className="w-full bg-zinc-950 border border-zinc-800 rounded px-3 py-1.5 text-white font-bold text-xs focus:outline-none focus:border-emerald-500"
+                    placeholder="800"
+                  />
+                  <div className="text-[10px] text-zinc-500 mt-1">
+                    0 = aucun filtre de score (seul le flag Danger sera vérifié).
+                  </div>
+                </div>
+
+                {/* Quick Presets */}
+                <div>
+                  <div className="flex items-center justify-between mb-1.5 text-[11px]">
+                    <span className="text-zinc-300 font-semibold">PRESETS DE SÉCURITÉ</span>
+                    <span className="text-[10px] text-zinc-500">Niveaux de prudence</span>
+                  </div>
+                  <div className="grid grid-cols-3 gap-1">
+                    {[
+                      { label: 'Strict (<300)', val: '300' },
+                      { label: 'Équilibré (<800)', val: '800' },
+                      { label: 'Tolérant (<1200)', val: '1200' },
+                    ].map((item) => (
+                      <button
+                        key={item.val}
+                        type="button"
+                        onClick={() => setMaxRugCheckScore(item.val)}
+                        className={`py-1 text-[11px] rounded border transition-colors cursor-pointer ${
+                          maxRugCheckScore === item.val
+                            ? 'bg-emerald-500 text-black border-emerald-400 font-bold'
+                            : 'bg-zinc-950 text-zinc-400 border-zinc-800 hover:text-white'
+                        }`}
+                      >
+                        {item.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Anti-Top & Bonding Curve Safety Layer (Protection cas $VOX) */}
+          <div className="p-3.5 rounded border border-purple-900/40 bg-purple-950/10 space-y-3">
+            <div className="flex items-center justify-between flex-wrap gap-2">
+              <div className="flex items-center gap-2">
+                <Target className="w-4 h-4 text-purple-400 shrink-0" />
+                <div>
+                  <div className="font-bold text-white text-xs flex items-center gap-2">
+                    <span>FILTRES ANTI-SOMMET & PUMP.FUN CURVE (EX: CAS $VOX)</span>
+                    <span className="px-1.5 py-0.5 rounded text-[9px] font-mono font-bold uppercase bg-purple-900/50 text-purple-300 border border-purple-700/50">
+                      Protection Exhaustion
+                    </span>
+                  </div>
+                  <div className="text-[11px] text-zinc-400 mt-0.5">
+                    Évite d'acheter au sommet de la bonding curve (lorsque les premiers acheteurs déchargent leurs sacs)
+                  </div>
+                </div>
+              </div>
+
+              {/* 5-Min Momentum Anti-Dump Toggle */}
+              <div className="flex items-center gap-2">
+                <span className="text-[10px] text-zinc-400 font-mono">Anti-Dump 5 min :</span>
+                <button
+                  type="button"
+                  onClick={() => setRequirePositiveMomentum5m(!requirePositiveMomentum5m)}
+                  className={`relative inline-flex h-5 w-10 items-center rounded-full transition-colors cursor-pointer ${
+                    requirePositiveMomentum5m ? 'bg-purple-500' : 'bg-zinc-800'
+                  }`}
+                  title="Bloquer le snipe si les ventes écrasent les achats sur les 5 dernières minutes"
+                >
+                  <span
+                    className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
+                      requirePositiveMomentum5m ? 'translate-x-5' : 'translate-x-1'
+                    }`}
+                  />
+                </button>
+              </div>
+            </div>
+
+            <div className="pt-2 border-t border-zinc-850 space-y-2.5">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                {/* Max Market Cap Input */}
+                <div>
+                  <div className="flex items-center justify-between mb-1.5 text-[11px]">
+                    <span className="text-zinc-300 font-semibold">MARKET CAP MAX D'ENTRÉE ($)</span>
+                    <span className="text-purple-300 font-bold">
+                      {parseInt(maxEntryMarketCapUsd, 10) === 0 ? 'Désactivé' : `< $${parseInt(maxEntryMarketCapUsd, 10).toLocaleString()}`}
+                    </span>
+                  </div>
+                  <input
+                    type="number"
+                    step="5000"
+                    min="0"
+                    max="1000000"
+                    value={maxEntryMarketCapUsd}
+                    onChange={(e) => setMaxEntryMarketCapUsd(e.target.value)}
+                    className="w-full bg-zinc-950 border border-zinc-800 rounded px-3 py-1.5 text-white font-bold text-xs focus:outline-none focus:border-purple-500"
+                    placeholder="40000"
+                  />
+                  <div className="grid grid-cols-4 gap-1 mt-1.5">
+                    {[
+                      { label: '25k$', val: '25000' },
+                      { label: '40k$', val: '40000' },
+                      { label: '60k$', val: '60000' },
+                      { label: 'Off', val: '0' },
+                    ].map((item) => (
+                      <button
+                        key={item.val}
+                        type="button"
+                        onClick={() => setMaxEntryMarketCapUsd(item.val)}
+                        className={`py-1 text-[10px] rounded border transition-colors cursor-pointer ${
+                          maxEntryMarketCapUsd === item.val
+                            ? 'bg-purple-500 text-white border-purple-400 font-bold'
+                            : 'bg-zinc-950 text-zinc-400 border-zinc-800 hover:text-white'
+                        }`}
+                      >
+                        {item.label}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="text-[10px] text-zinc-500 mt-1">
+                    $VOX a été acheté à $50,120 MC. Un plafond à $40,000 bloque ce type de piège de fin de courbe.
+                  </div>
+                </div>
+
+                {/* Max Token Age Input */}
+                <div>
+                  <div className="flex items-center justify-between mb-1.5 text-[11px]">
+                    <span className="text-zinc-300 font-semibold">ÂGE MAXIMAL DU TOKEN (MINUTES)</span>
+                    <span className="text-purple-300 font-bold">
+                      {parseInt(maxTokenAgeMinutes, 10) === 0 ? 'Illimité' : `< ${maxTokenAgeMinutes} min`}
+                    </span>
+                  </div>
+                  <input
+                    type="number"
+                    step="1"
+                    min="0"
+                    max="1440"
+                    value={maxTokenAgeMinutes}
+                    onChange={(e) => setMaxTokenAgeMinutes(e.target.value)}
+                    className="w-full bg-zinc-950 border border-zinc-800 rounded px-3 py-1.5 text-white font-bold text-xs focus:outline-none focus:border-purple-500"
+                    placeholder="15"
+                  />
+                  <div className="grid grid-cols-4 gap-1 mt-1.5">
+                    {[
+                      { label: '5 min', val: '5' },
+                      { label: '10 min', val: '10' },
+                      { label: '15 min', val: '15' },
+                      { label: 'Illimité', val: '0' },
+                    ].map((item) => (
+                      <button
+                        key={item.val}
+                        type="button"
+                        onClick={() => setMaxTokenAgeMinutes(item.val)}
+                        className={`py-1 text-[10px] rounded border transition-colors cursor-pointer ${
+                          maxTokenAgeMinutes === item.val
+                            ? 'bg-purple-500 text-white border-purple-400 font-bold'
+                            : 'bg-zinc-950 text-zinc-400 border-zinc-800 hover:text-white'
+                        }`}
+                      >
+                        {item.label}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="text-[10px] text-zinc-500 mt-1">
+                    Les tokens snipés dans leurs premières minutes ont 83% de taux de succès supérieur.
+                  </div>
+                </div>
+              </div>
             </div>
           </div>
 
