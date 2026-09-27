@@ -53,6 +53,9 @@ async function startServer() {
   const sniperEngine = new SniperEngine(dexscreener);
   const securityManager = new SecurityManager();
 
+  // Link sniper configuration to GMGNAnalyzer for real-time safety thresholds
+  gmgnAnalyzer.setConfigGetter(() => sniperEngine.getConfig());
+
   sniperEngine.setCallbacks(
     (positions) => broadcast({ type: 'POSITIONS_UPDATED', data: positions }),
     (trade) => broadcast({ type: 'TRADE_EXECUTED', data: trade })
@@ -87,6 +90,9 @@ async function startServer() {
         if (!call.tokenSymbol && report.tokenSymbol) {
           call.tokenSymbol = report.tokenSymbol;
         }
+        if (report.rejectionReason && report.decision === 'REJECTED') {
+          call.error = report.rejectionReason;
+        }
         broadcast({ type: 'CALL_ANALYZED', data: call });
 
         // GUARD: Strictly prevent auto-sniping historical calls or calls older than 2 minutes
@@ -101,16 +107,42 @@ async function startServer() {
         // If all 7 conditions passed and auto-snipe is enabled, execute snipe ONLY for fresh live calls!
         if (report.decision === 'SNIPED' && sniperEngine.getConfig().autoSnipe) {
           console.log(`[Server] ⚡ AUTO-SNIPING LIVE NEW CALL: ${report.tokenSymbol} (${call.tokenAddress})`);
-          const pos = await sniperEngine.executeSnipe(report);
-          broadcast({ type: 'SNIPE_EXECUTED', data: pos });
+          try {
+            const pos = await sniperEngine.executeSnipe(report);
+            broadcast({ type: 'SNIPE_EXECUTED', data: pos });
+          } catch (snipeErr: any) {
+            const msg = snipeErr?.message || '';
+            if (msg.includes('Snipe bloqué')) {
+              console.log(`[Server] 🛡️ Auto-snipe annulé par règle de sécurité: ${msg}`);
+              call.status = 'REJECTED';
+              call.error = msg;
+              if (call.analysis) {
+                call.analysis.decision = 'REJECTED';
+              }
+              broadcast({ type: 'CALL_ANALYZED', data: call });
+            } else {
+              console.error('[Server] Snipe execution error on call:', snipeErr);
+              call.status = 'REJECTED';
+              call.error = msg || 'Snipe execution failed';
+              broadcast({ type: 'CALL_ANALYZED', data: call });
+            }
+          }
         } else {
           const passedCount = report.conditions ? report.conditions.filter((c) => c.passed).length : 0;
           console.log(`[Server] Token evaluation for ${report.tokenSymbol || call.tokenAddress.slice(0, 8)}: ${passedCount}/7 criteria matched (${report.decision})`);
         }
       } catch (err: any) {
-        console.error('[Server] GMGN Analysis error on call:', err);
+        const msg = err?.message || 'GMGN Analysis failed';
+        if (msg.includes('Snipe bloqué')) {
+          console.log(`[Server] 🛡️ Snipe bloqué par filtre de sécurité: ${msg}`);
+        } else {
+          console.error('[Server] GMGN Analysis error on call:', err);
+        }
         call.status = 'REJECTED';
-        call.error = err.message || 'GMGN Analysis failed';
+        call.error = msg;
+        if (call.analysis) {
+          call.analysis.decision = 'REJECTED';
+        }
         broadcast({ type: 'CALL_ANALYZED', data: call });
       }
     },
@@ -244,6 +276,9 @@ async function startServer() {
       const call = existingCall || telegramListener.addManualCall(cleanAddr, report.tokenSymbol);
       call.analysis = report;
       call.status = report.decision;
+      if (report.rejectionReason && report.decision === 'REJECTED') {
+        call.error = report.rejectionReason;
+      }
       if (report.rugCheck) {
         call.rugCheck = report.rugCheck;
       }
@@ -294,6 +329,9 @@ async function startServer() {
 
       call.analysis = report;
       call.status = report.decision;
+      if (report.rejectionReason && report.decision === 'REJECTED') {
+        call.error = report.rejectionReason;
+      }
       if (report.rugCheck) {
         call.rugCheck = report.rugCheck;
       }
@@ -318,12 +356,17 @@ async function startServer() {
     }
 
     try {
-      const report = await gmgnAnalyzer.analyzeToken(tokenAddress.trim());
+      const report = await gmgnAnalyzer.analyzeToken(tokenAddress.trim(), undefined, sniperEngine.getConfig());
       const position = await sniperEngine.executeSnipe(report, customAmountSol);
       broadcast({ type: 'SNIPE_EXECUTED', data: position });
       res.json({ success: true, position });
     } catch (err: any) {
-      res.status(500).json({ error: err.message || 'Manual snipe failed' });
+      const msg = err?.message || 'Manual snipe failed';
+      if (msg.includes('Snipe bloqué')) {
+        console.log(`[Server] 🛡️ Snipe manuel bloqué par filtre de sécurité: ${msg}`);
+        return res.status(400).json({ success: false, error: msg, blocked: true });
+      }
+      res.status(500).json({ error: msg });
     }
   });
 

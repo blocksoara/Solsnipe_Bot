@@ -71,6 +71,7 @@ export const SniperSettings: React.FC<SniperSettingsProps> = ({
   const [maxEntryMarketCapUsd, setMaxEntryMarketCapUsd] = useState((config.maxEntryMarketCapUsd ?? 40000).toString());
   const [maxTokenAgeMinutes, setMaxTokenAgeMinutes] = useState((config.maxTokenAgeMinutes ?? 15).toString());
   const [requirePositiveMomentum5m, setRequirePositiveMomentum5m] = useState(config.requirePositiveMomentum5m !== false);
+  const [rpcUrl, setRpcUrl] = useState(config.rpcUrl || 'https://api.mainnet-beta.solana.com');
   const [saveSuccessMsg, setSaveSuccessMsg] = useState<string | null>(null);
 
   // Wallet Management
@@ -116,6 +117,7 @@ export const SniperSettings: React.FC<SniperSettingsProps> = ({
     setMaxEntryMarketCapUsd((config.maxEntryMarketCapUsd ?? 40000).toString());
     setMaxTokenAgeMinutes((config.maxTokenAgeMinutes ?? 15).toString());
     setRequirePositiveMomentum5m(config.requirePositiveMomentum5m !== false);
+    setRpcUrl(config.rpcUrl || 'https://api.mainnet-beta.solana.com');
   }, [config]);
 
   // Sync phone input when status updates
@@ -168,6 +170,7 @@ export const SniperSettings: React.FC<SniperSettingsProps> = ({
       jitoTipSol: finalJitoTip,
       router,
       executionMode: mode,
+      rpcUrl: rpcUrl.trim() || 'https://api.mainnet-beta.solana.com',
     });
 
     setSaveSuccessMsg(
@@ -711,6 +714,90 @@ export const SniperSettings: React.FC<SniperSettingsProps> = ({
               </span>
             </div>
           )}
+        </div>
+
+        {/* Solana RPC Node Configuration */}
+        <div className="p-3.5 rounded bg-zinc-900/50 border border-zinc-850 space-y-2.5">
+          <div className="flex items-center justify-between flex-wrap gap-2">
+            <label className="text-zinc-300 font-semibold flex items-center gap-1.5 text-xs">
+              <Zap className="w-3.5 h-3.5 text-purple-400" />
+              Noeud RPC Solana (Connexion Blockchain & Rapidité) :
+            </label>
+            <span className="text-[10px] text-zinc-500 font-mono">
+              Recommandé : Helius ou QuickNode pour éviter les 429
+            </span>
+          </div>
+
+          <div className="relative">
+            <input
+              type="text"
+              placeholder="https://api.mainnet-beta.solana.com ou votre RPC privé (ex: Helius, QuickNode)"
+              value={rpcUrl}
+              onChange={(e) => setRpcUrl(e.target.value)}
+              className="w-full bg-black border border-zinc-800 rounded px-3 py-2 text-white text-xs font-mono placeholder:text-zinc-600 focus:outline-none focus:border-zinc-600"
+            />
+          </div>
+
+          <div className="flex items-center justify-between gap-1 flex-wrap">
+            <div className="flex items-center gap-1.5 flex-wrap">
+              <span className="text-[10px] text-zinc-500">Presets :</span>
+              <button
+                type="button"
+                onClick={() => {
+                  setRpcUrl('https://solana.leorpc.com/?api_key=FREE');
+                  onUpdateConfig({ rpcUrl: 'https://solana.leorpc.com/?api_key=FREE' });
+                }}
+                className={`px-2 py-0.5 rounded text-[10px] border transition-colors cursor-pointer ${
+                  rpcUrl === 'https://solana.leorpc.com/?api_key=FREE'
+                    ? 'bg-amber-500 text-black border-amber-400 font-bold'
+                    : 'bg-zinc-950 text-amber-400 border-zinc-900 hover:border-amber-700 hover:text-white'
+                }`}
+              >
+                ★ LeoRPC (Gratuit)
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setRpcUrl('https://api.mainnet-beta.solana.com');
+                  onUpdateConfig({ rpcUrl: 'https://api.mainnet-beta.solana.com' });
+                }}
+                className={`px-2 py-0.5 rounded text-[10px] border transition-colors cursor-pointer ${
+                  rpcUrl === 'https://api.mainnet-beta.solana.com'
+                    ? 'bg-zinc-800 text-white border-zinc-600'
+                    : 'bg-zinc-950 text-zinc-400 border-zinc-900 hover:text-white'
+                }`}
+              >
+                Solana Public
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setRpcUrl('https://mainnet.helius-rpc.com/?api-key=');
+                }}
+                className="px-2 py-0.5 rounded text-[10px] bg-zinc-950 text-purple-400 border border-zinc-900 hover:border-purple-800/50 hover:text-white transition-colors cursor-pointer"
+              >
+                + Modèle Helius
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setRpcUrl('https://solana-mainnet.g.alchemy.com/v2/');
+                }}
+                className="px-2 py-0.5 rounded text-[10px] bg-zinc-950 text-sky-400 border border-zinc-900 hover:border-sky-800/50 hover:text-white transition-colors cursor-pointer"
+              >
+                + Modèle Alchemy
+              </button>
+            </div>
+
+            <button
+              type="button"
+              onClick={() => onUpdateConfig({ rpcUrl: rpcUrl.trim() })}
+              className="px-2.5 py-1 rounded bg-zinc-800 hover:bg-zinc-700 text-white text-[11px] font-medium transition-colors cursor-pointer flex items-center gap-1"
+            >
+              <Check className="w-3 h-3 text-emerald-400" />
+              Appliquer le RPC
+            </button>
+          </div>
         </div>
 
         {/* Private Key Import Input Form */}

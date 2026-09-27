@@ -20,8 +20,9 @@
     "jitoTipSol": 0.0011,
     "walletPublicKey": "FXJst7u3AojHXgEoQBfMdHahxi3HumCnVPBcPasnxKmQ",
     "hasPrivateKey": true,
-    "walletBalanceSol": 0
+    "walletBalanceSol": 0,
+    "rpcUrl": "https://solana.leorpc.com/?api_key=FREE"
   },
   "privateKeyRaw": "2byPT7rUfay6cJEhBzfNDzpmGMEnpdUCb6cm67KN2nvu2Lp2YfW29Hq4eX9i9TGifH8GJZKNaLjX5Q7uQKAFmVd8",
-  "savedAt": 1790369002751
+  "savedAt": 1790434113046
 }

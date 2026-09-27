@@ -59,6 +59,7 @@ export interface GMGNAnalysisReport {
   conditions: GMGNConditionCheck[];
   allPassed: boolean;
   decision: 'SNIPED' | 'REJECTED';
+  rejectionReason?: string;
   evaluatedAt: number;
   executionTimeMs?: number;
   sources?: string[];
@@ -169,6 +170,7 @@ export interface SniperConfig {
   walletPublicKey: string;
   hasPrivateKey: boolean;
   walletBalanceSol?: number;
+  rpcUrl?: string;
 }
 
 export interface SecurityStatus {

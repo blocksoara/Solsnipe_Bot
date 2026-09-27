@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-import { GMGNAnalysisReport, GMGNConditionCheck, RugCheckRisk, RugCheckSummary } from '../src/types';
+import { GMGNAnalysisReport, GMGNConditionCheck, RugCheckRisk, RugCheckSummary, SniperConfig } from '../src/types';
 
 export interface TokenAnalysisContext {
   rawText?: string;
@@ -19,9 +19,14 @@ export class GMGNAnalyzer {
   private apiKey: string;
   private cache: Map<string, CacheEntry> = new Map();
   private gmgnCooldownUntil: number = 0;
+  private configGetter?: () => Partial<SniperConfig>;
 
   constructor(apiKey: string = process.env.GMGN_API_KEY || 'gmgn_a64e1d6f370b44c4431e582fd1106454') {
     this.apiKey = apiKey;
+  }
+
+  public setConfigGetter(getter: () => Partial<SniperConfig>): void {
+    this.configGetter = getter;
   }
 
   /**
@@ -30,9 +35,14 @@ export class GMGNAnalyzer {
    * and parses high-frequency Telegram alert metadata.
    * Completes in sub-second time (typically 150-300ms) with in-memory caching.
    */
-  public async analyzeToken(tokenAddress: string, context?: TokenAnalysisContext): Promise<GMGNAnalysisReport> {
+  public async analyzeToken(
+    tokenAddress: string,
+    context?: TokenAnalysisContext,
+    overrideConfig?: Partial<SniperConfig>
+  ): Promise<GMGNAnalysisReport> {
     const cleanAddress = tokenAddress.trim();
     const startTime = Date.now();
+    const config = overrideConfig || (this.configGetter ? this.configGetter() : undefined);
 
     // Check fast in-memory cache (30s TTL)
     const cached = this.cache.get(cleanAddress);
@@ -67,7 +77,7 @@ export class GMGNAnalyzer {
       }),
     ]);
 
-    const report = this.evaluateConditions(cleanAddress, dexData, rugcheckData, gmgnData, alertData, context);
+    const report = this.evaluateConditions(cleanAddress, dexData, rugcheckData, gmgnData, alertData, context, config);
     const duration = Date.now() - startTime;
     report.executionTimeMs = duration;
     report.sources = sourcesUsed;
@@ -421,7 +431,8 @@ export class GMGNAnalyzer {
     rug: any,
     gmgn: any,
     alertData: any,
-    context?: TokenAnalysisContext
+    context?: TokenAnalysisContext,
+    config?: Partial<SniperConfig>
   ): GMGNAnalysisReport {
     // 1. Basic Metadata
     const tokenSymbol =
@@ -555,6 +566,45 @@ export class GMGNAnalyzer {
       gmgn?.security?.renounced_freeze_account === true ||
       alertData?.hasBlacklist === true;
 
+    // Calculate token age in minutes
+    let tokenAgeMinutes: number | undefined = undefined;
+    if (dex?.pairCreatedAt) {
+      tokenAgeMinutes = Math.max(0, (Date.now() - Number(dex.pairCreatedAt)) / 60000);
+    } else if (context?.claimedAge || alertData?.claimedAge) {
+      const ageStr = (context?.claimedAge || alertData?.claimedAge || '').toLowerCase();
+      const mMatch = ageStr.match(/([0-9.]+)\s*(?:m|min)/);
+      const sMatch = ageStr.match(/([0-9.]+)\s*s/);
+      const hMatch = ageStr.match(/([0-9.]+)\s*h/);
+      if (mMatch) tokenAgeMinutes = parseFloat(mMatch[1]);
+      else if (sMatch) tokenAgeMinutes = parseFloat(sMatch[1]) / 60;
+      else if (hMatch) tokenAgeMinutes = parseFloat(hMatch[1]) * 60;
+    }
+
+    // Safety thresholds from SniperConfig
+    const maxEntryMc = config?.maxEntryMarketCapUsd ?? 40000;
+    const maxAgeMinutes = config?.maxTokenAgeMinutes ?? 15;
+    const isTooOld = maxAgeMinutes > 0 && tokenAgeMinutes !== undefined && tokenAgeMinutes > maxAgeMinutes;
+
+    let isHeavyDumping = false;
+    let momentumFailReason = '';
+    if (config?.requirePositiveMomentum5m !== false && dex?.txns?.m5) {
+      const m5Buys = dex.txns.m5.buys || 0;
+      const m5Sells = dex.txns.m5.sells || 0;
+      if (m5Sells > 0 && m5Buys === 0) {
+        isHeavyDumping = true;
+        momentumFailReason = `0 achat vs ${m5Sells} ventes sur 5 min`;
+      } else if (m5Sells >= 8 && m5Sells > m5Buys * 1.5) {
+        isHeavyDumping = true;
+        momentumFailReason = `Pression vendeuse dominante (${m5Sells} ventes vs ${m5Buys} achats sur 5 min)`;
+      }
+    }
+
+    const maxRugScore = config?.maxRugCheckScore ?? 800;
+    const isRugDanger =
+      config?.rejectOnRugCheckDanger !== false &&
+      (rugCheckSummary.status === 'danger' || rugCheckSummary.rugged);
+    const isRugScoreHigh = maxRugScore > 0 && rugScore > maxRugScore;
+
     // ================= EVALUATION OF THE 7 CONDITIONS =================
     const conditions: GMGNConditionCheck[] = [];
 
@@ -574,19 +624,25 @@ export class GMGNAnalyzer {
         : `REJET : Les 10 plus gros détenteurs possèdent ${top10HoldersPercent.toFixed(1)}% (seuil maximal strict de 30% dépassé).`,
     });
 
-    // Condition 2: MarketCap <= Volume (Volume must be >= Market Cap)
-    const cond2Passed = marketCapUsd > 0 && volumeUsd > 0 && marketCapUsd <= volumeUsd;
+    // Condition 2: MarketCap <= Volume (Volume must be >= Market Cap) AND MarketCap <= maxEntryMarketCapUsd
+    const cond2VolumePassed = marketCapUsd > 0 && volumeUsd > 0 && marketCapUsd <= volumeUsd;
+    const cond2McPassed = maxEntryMc <= 0 || marketCapUsd <= maxEntryMc;
+    const cond2Passed = cond2VolumePassed && cond2McPassed;
     conditions.push({
       id: 'c2_mc_vs_volume',
-      name: 'Market Cap vs Volume',
+      name: 'Market Cap vs Volume & Plafond',
       passed: cond2Passed,
-      rule: 'Market Cap must NOT be greater than Volume (MC <= Volume)',
+      rule: maxEntryMc > 0
+        ? `MC <= Volume et MC <= $${formatNumber(maxEntryMc)}`
+        : 'Market Cap must NOT be greater than Volume (MC <= Volume)',
       actualValue: `MC: $${formatNumber(marketCapUsd)} | Vol: $${formatNumber(volumeUsd)}`,
-      details: cond2Passed
-        ? `Volume solide validé : Volume ($${formatNumber(volumeUsd)}) supérieur ou égal à la Market Cap ($${formatNumber(marketCapUsd)}).`
-        : marketCapUsd <= 0 || volumeUsd <= 0
-        ? `REJET : Données de liquidité/volume insuffisantes (MC: $${formatNumber(marketCapUsd)}, Vol: $${formatNumber(volumeUsd)}).`
-        : `REJET : Market Cap ($${formatNumber(marketCapUsd)}) supérieure au Volume ($${formatNumber(volumeUsd)}). La MC ne doit pas dépasser le volume.`,
+      details: !cond2McPassed
+        ? `REJET : Market Cap ($${formatNumber(marketCapUsd)}) supérieure au plafond ($${formatNumber(maxEntryMc)}). Évite d'acheter au sommet de la bonding curve.`
+        : !cond2VolumePassed
+        ? (marketCapUsd <= 0 || volumeUsd <= 0
+          ? `REJET : Données de liquidité/volume insuffisantes (MC: $${formatNumber(marketCapUsd)}, Vol: $${formatNumber(volumeUsd)}).`
+          : `REJET : Market Cap ($${formatNumber(marketCapUsd)}) supérieure au Volume ($${formatNumber(volumeUsd)}). La MC ne doit pas dépasser le volume.`)
+        : `Volume solide validé : Volume ($${formatNumber(volumeUsd)}) supérieur ou égal à la Market Cap ($${formatNumber(marketCapUsd)}) et sous le plafond ($${formatNumber(maxEntryMc)}).`,
     });
 
     // Condition 3: Buyers >= Sellers
@@ -667,8 +723,28 @@ export class GMGNAnalyzer {
       isFreezeRenounced &&
       !isHoneypot &&
       !hasDangerRisks &&
-      rugCheckSummary.status !== 'danger' &&
-      !rugCheckSummary.rugged;
+      !isRugDanger &&
+      !isRugScoreHigh &&
+      !isTooOld &&
+      !isHeavyDumping &&
+      cond2McPassed;
+
+    let rejectionReason: string | undefined = undefined;
+    if (!cond2McPassed) {
+      rejectionReason = `Market Cap ($${formatNumber(marketCapUsd)}) supérieure au plafond ($${formatNumber(maxEntryMc)}). Évite d'acheter au sommet de la bonding curve.`;
+    } else if (isTooOld && tokenAgeMinutes !== undefined) {
+      rejectionReason = `Token trop ancien (${tokenAgeMinutes.toFixed(1)} min > ${maxAgeMinutes} min max). Risque d'essoufflement.`;
+    } else if (isHeavyDumping) {
+      rejectionReason = `Momentum négatif (${momentumFailReason}). Dégagement en cours.`;
+    } else if (isRugDanger) {
+      rejectionReason = `Risque RugCheck élevé (${rugCheckSummary.statusLabel} - ${rugScore} pts)`;
+    } else if (isRugScoreHigh) {
+      rejectionReason = `Score RugCheck (${rugScore}) supérieur au seuil max (${maxRugScore})`;
+    } else if (!allPassed) {
+      const failed = conditions.find((c) => !c.passed);
+      rejectionReason = failed ? failed.details : 'Critères GMGN non validés';
+    }
+
     const decision: 'SNIPED' | 'REJECTED' = allPassed && securityPassed ? 'SNIPED' : 'REJECTED';
 
     return {
@@ -697,11 +773,13 @@ export class GMGNAnalyzer {
       conditions,
       allPassed,
       decision,
+      rejectionReason,
       evaluatedAt: Date.now(),
       rugCheck: rugCheckSummary,
       rawMetrics: {
         launchpad: isPump ? 'pump.fun' : gmgn?.launchpad,
         rugScore,
+        tokenAgeMinutes,
         alertDevHolding: alertData?.devHoldingPercent,
       },
     };

@@ -72,6 +72,7 @@ export class SniperEngine {
     walletPublicKey: '',
     hasPrivateKey: false,
     walletBalanceSol: 0,
+    rpcUrl: process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com',
   };
 
   private privateKeyRaw: string = '';
@@ -85,7 +86,7 @@ export class SniperEngine {
 
   constructor(dexscreener: DexscreenerClient) {
     this.dexscreener = dexscreener;
-    const rpcUrl = process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
+    const rpcUrl = this.config.rpcUrl || process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
     this.connection = new Connection(rpcUrl, 'confirmed');
     
     // 1. Restore saved config and wallet if available
@@ -249,7 +250,16 @@ export class SniperEngine {
   }
 
   public updateConfig(newConfig: Partial<SniperConfig>): SniperConfig {
+    const oldRpc = this.config.rpcUrl;
     this.config = { ...this.config, ...newConfig };
+    if (this.config.rpcUrl && this.config.rpcUrl !== oldRpc) {
+      try {
+        this.connection = new Connection(this.config.rpcUrl, 'confirmed');
+        console.log(`[SniperEngine] 🔄 Updated Solana RPC connection to: ${this.config.rpcUrl}`);
+      } catch (e) {
+        console.warn('[SniperEngine] Failed to initialize connection with new RPC:', e);
+      }
+    }
     this.saveConfigToDisk();
     console.log('[SniperEngine] Config updated & persisted:', this.config);
     return this.config;
@@ -419,37 +429,71 @@ export class SniperEngine {
   ): Promise<{ success: boolean; txHash: string; error?: string }> {
     try {
       if (!this.privateKeyRaw) {
-        return { success: false, txHash: '', error: 'No private key configured' };
+        return { success: false, txHash: '', error: 'Aucune clé privée configurée pour l\'exécution live' };
       }
       const keypair = Keypair.fromSecretKey(decodeBase58(this.privateKeyRaw));
       const slippageBps = Math.floor(slippagePercent * 100);
 
-      const tokenAccounts = await this.connection.getParsedTokenAccountsByOwner(
+      // Search for on-chain token accounts
+      let tokenAccounts = await this.connection.getParsedTokenAccountsByOwner(
         keypair.publicKey,
         { mint: new PublicKey(tokenAddress) }
       );
 
+      // Retry up to 3 times with 800ms delay if empty (RPC indexing latency)
       if (!tokenAccounts.value || tokenAccounts.value.length === 0) {
-        return { success: false, txHash: '', error: 'No on-chain token account found for this mint' };
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          await new Promise((resolve) => setTimeout(resolve, 800));
+          tokenAccounts = await this.connection.getParsedTokenAccountsByOwner(
+            keypair.publicKey,
+            { mint: new PublicKey(tokenAddress) }
+          );
+          if (tokenAccounts.value && tokenAccounts.value.length > 0) break;
+        }
+      }
+
+      // Check Token-2022 program fallback if standard SPL token accounts not found
+      if (!tokenAccounts.value || tokenAccounts.value.length === 0) {
+        try {
+          const TOKEN_2022_PROGRAM_ID = new PublicKey('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb');
+          const token2022Accounts = await this.connection.getParsedTokenAccountsByOwner(
+            keypair.publicKey,
+            { programId: TOKEN_2022_PROGRAM_ID }
+          );
+          const match = token2022Accounts.value.filter(
+            (acc) => acc.account.data.parsed.info.mint === tokenAddress
+          );
+          if (match.length > 0) {
+            tokenAccounts = { value: match } as any;
+          }
+        } catch {}
+      }
+
+      if (!tokenAccounts.value || tokenAccounts.value.length === 0) {
+        return { success: false, txHash: '', error: 'Aucun compte de token on-chain trouvé pour ce mint' };
       }
 
       const rawBalance = tokenAccounts.value[0].account.data.parsed.info.tokenAmount.amount;
       if (!rawBalance || BigInt(rawBalance) <= 0n) {
-        return { success: false, txHash: '', error: 'Zero on-chain token balance' };
+        return { success: false, txHash: '', error: 'Solde de tokens on-chain nul (0)' };
       }
 
       const sellAmount = (BigInt(rawBalance) * BigInt(percent)) / 100n;
       if (sellAmount <= 0n) {
-        return { success: false, txHash: '', error: 'Sell amount calculates to 0' };
+        return { success: false, txHash: '', error: 'Montant de vente calculé nul (0)' };
       }
 
       // Request Jupiter quote for Token -> SOL
       const quoteUrl = `https://api.jup.ag/swap/v1/quote?inputMint=${tokenAddress}&outputMint=So11111111111111111111111111111111111111112&amount=${sellAmount.toString()}&slippageBps=${slippageBps}`;
       const quoteRes = await fetch(quoteUrl, { signal: AbortSignal.timeout(6000) });
       if (!quoteRes.ok) {
-        return { success: false, txHash: '', error: 'Jupiter sell quote failed' };
+        const errBody = await quoteRes.text();
+        return { success: false, txHash: '', error: `Échec du quote Jupiter : ${errBody}` };
       }
       const quoteData = await quoteRes.json();
+      if (!quoteData || !quoteData.outAmount) {
+        return { success: false, txHash: '', error: 'Aucune route de vente disponible sur Jupiter' };
+      }
 
       const swapRes = await fetch('https://api.jup.ag/swap/v1/swap', {
         method: 'POST',
@@ -464,7 +508,8 @@ export class SniperEngine {
       });
 
       if (!swapRes.ok) {
-        return { success: false, txHash: '', error: 'Jupiter sell swap transaction build failed' };
+        const errBody = await swapRes.text();
+        return { success: false, txHash: '', error: `Construction de la transaction Jupiter échouée : ${errBody}` };
       }
 
       const { swapTransaction } = await swapRes.json();
@@ -592,8 +637,9 @@ export class SniperEngine {
         txHash = liveResult.txHash;
         console.log(`[SniperEngine] ✓ Live swap executed for ${report.tokenSymbol}: ${txHash}`);
       } else {
-        console.warn(`[SniperEngine] ℹ️ Live swap note: ${liveResult.error || 'Swapping in simulation mode'}`);
-        finalExecutionMode = 'simulation';
+        const errorMsg = `Échec de l'achat en mode réel : ${liveResult.error || 'Erreur swap Jupiter'}`;
+        console.error(`[SniperEngine] ❌ ${errorMsg}`);
+        throw new Error(errorMsg);
       }
     }
 
@@ -704,13 +750,21 @@ export class SniperEngine {
 
     // REAL MODE SELL:
     if (position.executionMode === 'wallet') {
+      const effectiveSlippage = (reason.includes('Stop Loss') || reason.includes('Trailing'))
+        ? Math.max(this.config.slippagePercent, 15)
+        : this.config.slippagePercent;
+
       const liveSellResult = await this.executeLiveSwapSell(
         position.tokenAddress,
         clampedPercent,
-        this.config.slippagePercent
+        effectiveSlippage
       );
       if (liveSellResult.success && liveSellResult.txHash) {
         tradeTxId = liveSellResult.txHash;
+      } else {
+        const errorMsg = `Échec de la vente on-chain en mode réel : ${liveSellResult.error || 'Erreur swap Jupiter'}`;
+        console.error(`[SniperEngine] ❌ ${errorMsg} pour ${position.tokenSymbol}. Position maintenue OUVERTE.`);
+        throw new Error(errorMsg);
       }
     }
 
@@ -776,13 +830,18 @@ export class SniperEngine {
       console.log(
         `[SniperEngine] 🎯 TAKE PROFIT TRIGGERED: ${pos.tokenSymbol} reached $${currentPriceUsd} (+${pos.pnlPercent.toFixed(2)}% >= +${pos.tpPercent}%)`
       );
-      await this.sellPosition(
-        pos.id,
-        100,
-        `Take Profit Hit (+${pos.pnlPercent.toFixed(1)}%)`,
-        currentPriceUsd
-      );
-      return true;
+      try {
+        await this.sellPosition(
+          pos.id,
+          100,
+          `Take Profit Hit (+${pos.pnlPercent.toFixed(1)}%)`,
+          currentPriceUsd
+        );
+        return true;
+      } catch (err: any) {
+        console.warn(`[SniperEngine] ⚠️ Take Profit execution error for ${pos.tokenSymbol}:`, err.message);
+        return false;
+      }
     }
 
     // 2. Stop Loss (active if > 0)
@@ -790,13 +849,18 @@ export class SniperEngine {
       console.log(
         `[SniperEngine] 🛑 STOP LOSS TRIGGERED: ${pos.tokenSymbol} dropped to $${currentPriceUsd} (${pos.pnlPercent.toFixed(2)}% <= -${pos.slPercent}%)`
       );
-      await this.sellPosition(
-        pos.id,
-        100,
-        `Stop Loss Triggered (${pos.pnlPercent.toFixed(1)}%)`,
-        currentPriceUsd
-      );
-      return true;
+      try {
+        await this.sellPosition(
+          pos.id,
+          100,
+          `Stop Loss Triggered (${pos.pnlPercent.toFixed(1)}%)`,
+          currentPriceUsd
+        );
+        return true;
+      } catch (err: any) {
+        console.warn(`[SniperEngine] ⚠️ Stop Loss execution error for ${pos.tokenSymbol}:`, err.message);
+        return false;
+      }
     }
 
     // 3. Trailing Stop (active if > 0, price peaked above entry, and retreated by trailingStopPercent from peak)
@@ -810,13 +874,18 @@ export class SniperEngine {
       console.log(
         `[SniperEngine] 📉 TRAILING STOP TRIGGERED: ${pos.tokenSymbol} pulled back to $${currentPriceUsd} (-${pos.trailingStopPercent}% du pic $${pos.peakPriceUsd} [+${peakGainPercent.toFixed(1)}%])`
       );
-      await this.sellPosition(
-        pos.id,
-        100,
-        `Trailing Stop Triggered (-${pos.trailingStopPercent}% du pic)`,
-        currentPriceUsd
-      );
-      return true;
+      try {
+        await this.sellPosition(
+          pos.id,
+          100,
+          `Trailing Stop Triggered (-${pos.trailingStopPercent}% du pic)`,
+          currentPriceUsd
+        );
+        return true;
+      } catch (err: any) {
+        console.warn(`[SniperEngine] ⚠️ Trailing Stop execution error for ${pos.tokenSymbol}:`, err.message);
+        return false;
+      }
     }
 
     // 4. Stagnation Auto-Sell (Sell 100% if price does not move after stagnantTimeoutSeconds)
@@ -847,13 +916,18 @@ export class SniperEngine {
         console.log(
           `[SniperEngine] ⌛ AUTO-SELL STAGNATION TRIGGERED: ${pos.tokenSymbol} price static for ${Math.round(elapsedWithoutMovementSec)}s (PnL: ${pos.pnlPercent.toFixed(2)}%). Executing automatic 100% exit.`
         );
-        await this.sellPosition(
-          pos.id,
-          100,
-          `Stagnation : Prix immobile après ${minutesFormatted} min (${pos.pnlPercent >= 0 ? '+' : ''}${pos.pnlPercent.toFixed(2)}%)`,
-          currentPriceUsd
-        );
-        return true;
+        try {
+          await this.sellPosition(
+            pos.id,
+            100,
+            `Stagnation : Prix immobile après ${minutesFormatted} min (${pos.pnlPercent >= 0 ? '+' : ''}${pos.pnlPercent.toFixed(2)}%)`,
+            currentPriceUsd
+          );
+          return true;
+        } catch (err: any) {
+          console.warn(`[SniperEngine] ⚠️ Stagnation exit execution error for ${pos.tokenSymbol}:`, err.message);
+          return false;
+        }
       }
     }
 
